@@ -1,0 +1,6 @@
+langchain
+langchain-google-genai
+langgraph
+pdf2image
+pydantic
+python-dotenv
