@@ -65,9 +65,25 @@ def extractor_node(state: ATS_State):
     }
     
 def github_node(state: ATS_State):
-    print(f"Investigating Github for user {state['github_username']}....")
+    username = state.get("github_username")
+    
+    # Guard against missing, null, or placeholder usernames
+    if not username or str(username).strip().lower() in ["null", "none", "na", "n/a", ""]:
+        print("No GitHub username found or provided. Skipping GitHub investigation.")
+        return {
+            "github_username": None,
+            "github_data": {
+                "name": "N/A",
+                "total_public_repositories": 0,
+                "account_created": "N/A",
+                "bio": "No GitHub profile provided",
+                "recent_projects": []
+            }
+        }
+        
+    print(f"Investigating Github for user {username}....")
     # Calling the tools.py agent
-    github_report: GitHubReport = run_github_agent(state["github_username"])
+    github_report: GitHubReport = run_github_agent(username)
     # Convert Pydantic object to plain dictionary for state serialization
     return {
         "github_data": github_report.model_dump()
@@ -225,8 +241,8 @@ workflow.add_edge("communicator",END)
 app = workflow.compile()
 
 if __name__ == "__main__":
-    pdf_path = "Aniketh__Software_offCampus.pdf"
-    jd_path = "JD for Interns 2.docx"
+    pdf_path = "2022B3A40527H_Bigbasket.pdf"
+    jd_path = "bigbasket_Product_Internship_JD.pdf"
     test_resume = read_document_content(llm, pdf_path)
     test_jd = read_document_content(llm, jd_path)
     state: ATS_State = {

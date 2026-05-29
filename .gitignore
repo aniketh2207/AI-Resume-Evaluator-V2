@@ -32,4 +32,5 @@ Thumbs.db
 *.pdf
 *.docx
 *.xlsx
-output.json
+output*.json
+*report.md

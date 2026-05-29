@@ -1,6 +1,6 @@
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
-from typing import Literal
+from typing import Literal, Optional
 import io
 import fitz  # PyMuPDF
 import base64
@@ -8,7 +8,7 @@ import base64
 # Define the structured output schema
 class CandidateInfo(BaseModel):
     name: str = Field(description="The full name of the candidate")
-    github_username: str = Field(description="The candidate's GitHub username")
+    github_username: Optional[str] = Field(None, description="The candidate's GitHub username. If not mentioned or not found in the resume, return null.")
     category: Literal["student", "experienced"] = Field(description="If they mention college or studying, they are a student. Otherwise, experienced.")
 
 # Define the extraction helper function
