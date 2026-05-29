@@ -4,3 +4,6 @@ langgraph
 pdf2image
 pydantic
 python-dotenv
+pandas
+openpyxl
+tabulate
