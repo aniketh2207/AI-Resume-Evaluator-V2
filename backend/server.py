@@ -14,11 +14,16 @@ from contextlib import asynccontextmanager
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
+from dotenv import load_dotenv
+
+# Load local environment variables
+load_dotenv()
+
 from main import app as ats_workflow, ATS_State, fast_llm
 from extractor import read_document_content, extract_jd_data, check_candidate_eligibility
 
 # --- Configuration ---
-cloud_url = "mongodb+srv://ats_admin:KwLrUkNkBQ.eA5_@cluster0.atmsxdv.mongodb.net/?appName=Cluster0"
+cloud_url = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "E:/AI-Resume-Evaluator-V2/backend/ai-resume-evaluator-498012-305d5547940c.json"
 PROJECT_ID = "ai-resume-evaluator-498012"
 SUBSCRIPTION_ID = "ats-local-worker"

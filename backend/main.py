@@ -309,7 +309,7 @@ def jd_evaluator_node(state: ATS_State):
                 from pymongo import MongoClient
                 from bson import ObjectId
                 # Retrieve skills from database
-                cloud_url = "mongodb+srv://ats_admin:KwLrUkNkBQ.eA5_@cluster0.atmsxdv.mongodb.net/?appName=Cluster0"
+                cloud_url = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
                 db_client = MongoClient(cloud_url)
                 db = db_client.ats_database
                 job = db.jobs.find_one({"_id": ObjectId(job_id)})
