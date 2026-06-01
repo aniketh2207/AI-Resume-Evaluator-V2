@@ -34,3 +34,22 @@ Thumbs.db
 *.xlsx
 output*.json
 *report.md
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/logs/
+frontend/*.log
+
+# Google API & GCP Secrets
+backend/token.json
+backend/credentials.json
+backend/client_secret*.json
+backend/ai-resume-evaluator-*.json
+
+# Gmail Integration Test Files
+backend/test_gmail_ingestion.py
+backend/register_watch.py
+backend/check_permissions.py
+backend/publish_test_message.py

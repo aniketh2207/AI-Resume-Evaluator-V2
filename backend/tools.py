@@ -42,7 +42,24 @@ async def _fetch_languages_async(client: httpx.AsyncClient, username: str, repo_
         pass
     return repo_name, []
 
-async def _check_github_async(username: str) -> str:
+def is_project_match(repo_name: str, projects_to_verify: Optional[List[str]]) -> bool:
+    if not projects_to_verify:
+        return False
+    repo_clean = repo_name.lower().replace("-", "").replace("_", "")
+    for title in projects_to_verify:
+        if not title:
+            continue
+        # Split title by common delimiters and then into words
+        base_title = title.split("—")[0].split("-")[0].split(":")[0].split("|")[0].strip()
+        words = [w.lower().strip() for w in base_title.split() if w.strip()]
+        for word in words:
+            if len(word) >= 3:
+                word_clean = word.replace("-", "").replace("_", "")
+                if word_clean in repo_clean or repo_clean in word_clean:
+                    return True
+    return False
+
+async def _check_github_async(username: str, projects_to_verify: Optional[List[str]] = None) -> str:
     print(f"\n[TOOL TRIGGERED] Fetching live GitHub data for: {username}...")
     
     # Optional GITHUB_TOKEN support
@@ -55,8 +72,11 @@ async def _check_github_async(username: str) -> str:
     
     async with httpx.AsyncClient() as client:
         # Fetch user profile
-        profile_response = await client.get(profile_url, headers=headers, timeout=5.0)
-        
+        try:
+            profile_response = await client.get(profile_url, headers=headers, timeout=5.0)
+        except Exception as e:
+            return f"Error connecting to GitHub API for profile: {str(e)}"
+            
         if profile_response.status_code == 404:
             return f"Candidate GitHub profile '{username}' not found."
         elif profile_response.status_code == 403:
@@ -72,8 +92,11 @@ async def _check_github_async(username: str) -> str:
         
         # Fetch repositories (up to 15 recent projects)
         repos_url = f"https://api.github.com/users/{username}/repos?per_page=15&sort=updated"
-        repos_response = await client.get(repos_url, headers=headers, timeout=5.0)
-        
+        try:
+            repos_response = await client.get(repos_url, headers=headers, timeout=5.0)
+        except Exception as e:
+            return f"Error connecting to GitHub API for repositories: {str(e)}"
+            
         if repos_response.status_code == 403:
             return "GitHub API rate limit exceeded while fetching repositories."
         
@@ -81,26 +104,44 @@ async def _check_github_async(username: str) -> str:
         if repos_response.status_code == 200:
             repos_data = repos_response.json()
             
-            # Include all public repositories, including forks (which might be team projects)
-            top_repos = repos_data
+            # Determine which repos require detailed language breakdowns
+            matched_repos = []
+            other_repos = []
             
-            # Asynchronously fetch language breakdowns in parallel
-            tasks = [_fetch_languages_async(client, username, repo.get('name'), headers) for repo in top_repos]
+            for repo in repos_data:
+                repo_name = repo.get('name', '')
+                if is_project_match(repo_name, projects_to_verify):
+                    matched_repos.append(repo)
+                else:
+                    other_repos.append(repo)
+            
+            # Query detailed languages for matched repos, plus up to top 3 active unmatched repos
+            repos_to_query_languages = matched_repos + other_repos[:3]
+            
+            # Asynchronously fetch language breakdowns in parallel for selected repos
+            tasks = [_fetch_languages_async(client, username, repo.get('name'), headers) for repo in repos_to_query_languages]
             languages_results = await asyncio.gather(*tasks)
             languages_map = dict(languages_results)
             
             repo_summary = "\nProjects & Details (including forks):\n"
-            for repo in top_repos:
+            for repo in repos_data:
                 repo_name = repo.get('name', 'Unknown')
                 description = repo.get('description') or 'No description provided'
                 stars = repo.get('stargazers_count', 0)
                 last_pushed = repo.get('pushed_at', 'Unknown')
+                is_fork = repo.get('fork', False)
+                fork_status = " (Forked Repository)" if is_fork else ""
                 
-                langs = languages_map.get(repo_name, [])
-                lang_str = ", ".join(langs) if langs else repo.get('language') or 'N/A'
+                # Use query results if fetched, otherwise fall back to primary language
+                if repo_name in languages_map:
+                    langs = languages_map[repo_name]
+                    lang_str = ", ".join(langs) if langs else repo.get('language') or 'N/A'
+                else:
+                    primary_lang = repo.get('language')
+                    lang_str = primary_lang if primary_lang else 'N/A'
                 
                 repo_summary += (
-                    f"- {repo_name}:\n"
+                    f"- {repo_name}{fork_status}:\n"
                     f"  Description: {description}\n"
                     f"  Languages: {lang_str}\n"
                     f"  Stars: {stars}\n"
@@ -118,20 +159,51 @@ async def _check_github_async(username: str) -> str:
     return final_report
 
 @tool
-def check_github(username: str) -> str:
-    """Fetches comprehensive GitHub profile statistics (including account creation date, bio), and detailed language and star breakdowns for the candidate's public repositories (including forks)."""
-    # Execute the async function synchronously using asyncio.run
-    return asyncio.run(_check_github_async(username))
+def check_github(username: str, projects_to_verify: Optional[List[str]] = None) -> str:
+    """Fetches comprehensive GitHub profile statistics, and detailed language and star breakdowns for the candidate's public repositories, focusing detailed analysis on specified projects to verify."""
+    import threading
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+        
+    if loop and loop.is_running():
+        # Spin up a thread to run the async task with its own event loop to avoid event loop conflicts in FastAPI/Uvicorn
+        result = None
+        exception = None
+        def target():
+            nonlocal result, exception
+            try:
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                result = new_loop.run_until_complete(_check_github_async(username, projects_to_verify))
+            except Exception as e:
+                exception = e
+            finally:
+                new_loop.close()
+        
+        thread = threading.Thread(target=target)
+        thread.start()
+        thread.join()
+        if exception:
+            raise exception
+        return result
+    else:
+        return asyncio.run(_check_github_async(username, projects_to_verify))
 
 # Binding the tool to the LLM
 tools = [check_github]
 llm_with_tools = llm.bind_tools(tools)
 
 # The GitHub Agent returning structured output
-def run_github_agent(username: str) -> GitHubReport:
+def run_github_agent(username: str, projects_to_verify: Optional[List[str]] = None) -> GitHubReport:
+    context = ""
+    if projects_to_verify:
+        context = f" Here are the candidate's resume projects to verify: {', '.join(projects_to_verify)}."
+
     messages = [
-        SystemMessage(content="You are a highly professional AI assistant. Fetch the candidate's GitHub details and return a structured JSON report containing their name, total public repositories, and all listed recent projects."),
-        HumanMessage(content=f"Check the github status of the candidate, username - {username} and return the function message")
+        SystemMessage(content="You are a highly professional AI assistant. Fetch the candidate's GitHub details and return a structured JSON report containing their name, total public repositories, and all listed recent projects. Pass projects_to_verify to the check_github tool if available."),
+        HumanMessage(content=f"Check the github status of the candidate, username - {username}.{context} Return the function message.")
     ]
     
     print(f"Contacting Gemini (GitHub Agent) for username: {username}...")
