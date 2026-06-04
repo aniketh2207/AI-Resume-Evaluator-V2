@@ -79,6 +79,10 @@ class WorkExperienceInfo(BaseModel):
     duration: str = Field(description="Start and end dates")
     description: str = Field(description="Key responsibilities and achievements")
 
+class GitHubRepoLink(BaseModel):
+    project_name: str = Field(description="The name of the project this GitHub repository link belongs to. If not explicitly mapped, use a key representing the project or the repository name.")
+    repo_url: str = Field(description="The direct URL of the GitHub repository (e.g. https://github.com/username/repo)")
+
 # Define the structured output schema
 class CandidateInfo(BaseModel):
     name: str = Field(description="The full name of the candidate")
@@ -91,6 +95,7 @@ class CandidateInfo(BaseModel):
     projects: List[ProjectResumeInfo] = Field(default_factory=list, description="List of projects built")
     skills: List[str] = Field(default_factory=list, description="Technical skills listed")
     certifications: List[str] = Field(default_factory=list, description="Professional certifications")
+    github_project_links: List[GitHubRepoLink] = Field(default_factory=list, description="A list of direct GitHub repository links found in the resume mapped to their respective project names.")
     miscellaneous_details: Optional[str] = Field(None, description="Any other details, achievements, interests, test scores, honours, activities, or general info found in the resume that do not fit the fields above.")
 
 # Define the extraction helper function
@@ -105,23 +110,33 @@ def extract_candidate_info(llm, resume_text: str) -> CandidateInfo:
 # New function for raw content reading/transcription
 def read_pdf_content(llm, pdf_path: str) -> str:
     doc = fitz.open(pdf_path)
-    page = doc.load_page(0)
-    links = page.get_links()
-    urls = [link.get('uri') for link in links if link.get('uri')]
-    urls_str = "\n".join(urls)
-    pix = page.get_pixmap()
-    image_bytes = pix.tobytes("jpeg")
+    all_urls = []
+    content_parts = [
+        {"type": "text", "text": "Please read these resume images and extract their complete contents in detail page by page."}
+    ]
     
-    code = base64.b64encode(image_bytes).decode("utf-8")
+    for page in doc:
+        # Get links from current page
+        links = page.get_links()
+        all_urls.extend([link.get('uri') for link in links if link.get('uri')])
+        
+        # Render page to image
+        pix = page.get_pixmap()
+        image_bytes = pix.tobytes("jpeg")
+        code = base64.b64encode(image_bytes).decode("utf-8")
+        
+        content_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{code}"}
+        })
+        
+    urls_str = "\n".join(all_urls)
     
     messages = [
         SystemMessage(content=f"""You are a highly professional AI assistant.
-         Read the resume image and transcribe its full content. Preserve the sections, work history, skills, and contact details exactly as written. 
+         Read the resume images and transcribe their full content. Preserve the sections, work history, skills, and contact details exactly as written. 
          the urls from the resume are {urls_str}"""),
-        HumanMessage(content=[
-            {"type": "text", "text": "Please read this resume image and extract its complete contents in detail."},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{code}"}}
-        ])
+        HumanMessage(content=content_parts)
     ]
     response = llm.invoke(messages)
     
@@ -159,14 +174,21 @@ def read_document_content(llm, file_path: str) -> str:
             return f.read()
 
 if __name__ == "__main__":
-    from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain_google_vertexai import ChatVertexAI
     from dotenv import load_dotenv
     load_dotenv()
     
-    # Initialize the LLM with the quota-friendly model
-    llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", temperature=0)
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "E:/AI-Resume-Evaluator-V2/backend/ai-resume-evaluator-498012-305d5547940c.json"
     
-    pdf_path = "Aniketh__Software_offCampus.pdf"
+    # Initialize the LLM with Vertex AI gemini-2.5-flash
+    llm = ChatVertexAI(
+        model_name="gemini-2.5-flash",
+        project="ai-resume-evaluator-498012",
+        location="us-central1",
+        temperature=0
+    )
+    
+    pdf_path = "2023A7PS0123H_ Earn In.pdf"
     print(f"Reading and transcribing complete content from {pdf_path}...")
     full_content = read_pdf_content(llm, pdf_path)
     

@@ -5,7 +5,12 @@ import base64
 from typing import Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, RedirectResponse
+import shutil
+import uuid
 import uvicorn
+from google.cloud import storage
+import datetime
 from pymongo import MongoClient
 from bson import ObjectId
 from google.cloud import pubsub_v1
@@ -19,14 +24,43 @@ from dotenv import load_dotenv
 # Load local environment variables
 load_dotenv()
 
-from main import app as ats_workflow, ATS_State, fast_llm
-from extractor import read_document_content, extract_jd_data, check_candidate_eligibility
-
-# --- Configuration ---
-cloud_url = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+# --- Configuration & Credentials ---
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "E:/AI-Resume-Evaluator-V2/backend/ai-resume-evaluator-498012-305d5547940c.json"
 PROJECT_ID = "ai-resume-evaluator-498012"
-SUBSCRIPTION_ID = "ats-local-worker"
+LOCATION = "us-central1"
+
+# Instantiate Vertex AI Models using Gemini 2.5
+from langchain_google_vertexai import ChatVertexAI
+
+fast_llm = ChatVertexAI(
+    model_name="gemini-2.5-flash",
+    project=PROJECT_ID,
+    location=LOCATION,
+    temperature=0
+)
+
+heavy_llm = ChatVertexAI(
+    model_name="gemini-2.5-pro",
+    project=PROJECT_ID,
+    location=LOCATION,
+    temperature=0
+)
+
+# Apply bindings to main and tools modules
+import main
+main.fast_llm = fast_llm
+main.heavy_llm = heavy_llm
+main.llm = fast_llm
+
+import tools
+tools.llm = fast_llm
+tools.llm_with_tools = fast_llm.bind_tools(tools.tools)
+
+from main import app as ats_workflow, ATS_State, jd_evaluator_node, communicator_node
+from extractor import read_document_content, extract_jd_data, check_candidate_eligibility
+
+cloud_url = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+SUBSCRIPTION_ID = "ats-gmail-listener" 
 
 # Initialize MongoDB
 db_client = MongoClient(cloud_url)
@@ -34,10 +68,33 @@ db = db_client.ats_database
 candidates_collection = db.candidates
 jobs_collection = db.jobs
 
-# ==========================================
-# 1. SHARED CORE LOGIC
-# ==========================================
-def process_candidate_pipeline(resume_path: str, jd_path: str, job_id: Optional[str] = None):
+def upload_resume_to_gcs(local_file_path: str, candidate_email: str, job_id: str) -> str:
+    """Uploads candidate resume PDF from local temp path to Google Cloud Storage bucket."""
+    bucket_name = "ats-candidate-resumes-498012"
+    
+    # Generate unique clean filename: job_id/candidate_email_uuid.pdf
+    email_clean = "".join(c for c in candidate_email if c.isalnum() or c in ".-_@")
+    email_clean = email_clean.replace("@", "_at_").lower().strip()
+    
+    unique_id = uuid.uuid4().hex
+    blob_name = f"{job_id}/{email_clean}_{unique_id}.pdf"
+    
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        
+        # Upload the file to GCS bucket
+        blob.upload_from_filename(local_file_path, content_type="application/pdf")
+        
+        gcs_uri = f"gs://{bucket_name}/{blob_name}"
+        print(f"Successfully uploaded resume to GCS: {gcs_uri}")
+        return gcs_uri
+    except Exception as e:
+        print(f"Error uploading resume to GCS: {e}")
+        return ""
+
+def process_candidate_pipeline(resume_path: str, jd_path: str, job_id: Optional[str] = None, resume_gcs_uri: Optional[str] = None):
     """Shared function to run the LangGraph pipeline and save to DB."""
     print("Extracting text from files...")
     resume_text = read_document_content(fast_llm, resume_path)
@@ -94,14 +151,17 @@ def process_candidate_pipeline(resume_path: str, jd_path: str, job_id: Optional[
                     "project_verification": "Skipped: Candidate did not meet basic job eligibility requirements.",
                     "score": 0,
                     "reasoning": f"AUTOMATIC PRE-SCREENING REJECTION:\n\nCandidate failed eligibility rules:\n{eligibility.reason}",
+                    "ats_reasoning_summary": "Failed basic eligibility pre-screening.",
                     "jd_score": 0,
                     "jd_reasoning": f"AUTOMATIC PRE-SCREENING REJECTION:\n\nCandidate failed eligibility rules:\n{eligibility.reason}",
+                    "jd_reasoning_summary": "Failed basic eligibility pre-screening.",
                     "final_weighted_score": 0.0,
                     "final_decision": "rejected",
                     "candidate_email": f"Dear {candidate_name},\n\nThank you for your interest in our job role. After reviewing your profile, we have determined that you do not meet the minimum eligibility requirements specified for this position. Therefore, we will not be moving forward with your application at this time.\n\nBest regards,\nHR Recruiting Team",
                     "hiring_manager_brief": f"Candidate failed eligibility check: {eligibility.reason}. Evaluation bypassed to save pipeline usage.",
                     "interview_questions": [],
-                    "job_id": job_id
+                    "job_id": job_id,
+                    "resume_gcs_uri": resume_gcs_uri
                 }
                 
                 inserted_doc = candidates_collection.insert_one(final_state)
@@ -119,9 +179,10 @@ def process_candidate_pipeline(resume_path: str, jd_path: str, job_id: Optional[
         "category": None, "education": None, "experience": None, "projects": None,
         "skills": None, "certifications": None, "miscellaneous_details": None,
         "github_data": None, "project_verification": None, "score": None,
-        "reasoning": None, "jd_score": None, "jd_reasoning": None,
+        "reasoning": None, "ats_reasoning_summary": None, "jd_score": None, "jd_reasoning": None, "jd_reasoning_summary": None,
         "final_weighted_score": None, "final_decision": None,
-        "candidate_email": None, "hiring_manager_brief": None, "interview_questions": None
+        "candidate_email": None, "hiring_manager_brief": None, "interview_questions": None,
+        "resume_gcs_uri": resume_gcs_uri
     }
 
     print("Triggering LangGraph Multi-Agent Pipeline...")
@@ -142,7 +203,7 @@ def process_candidate_pipeline(resume_path: str, jd_path: str, job_id: Optional[
 # ==========================================
 # GMAIL INGESTION HELPERS
 # ==========================================
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+SCOPES = ['https://www.googleapis.com/auth/gmail.modify'] # Upgraded to allow modifying labels
 
 def get_gmail_service():
     """Gets Gmail client using saved token.json."""
@@ -178,28 +239,25 @@ def find_attachments(parts):
     return attachments
 
 def process_pubsub_message(message: pubsub_v1.subscriber.message.Message):
+    # FIX 1: Immediate Acknowledgment to prevent the 10-second timeout loop
+    message.ack() 
     print(f"\n🔔 New Email Event Detected! Message ID: {message.message_id}")
     
     try:
-        payload = json.loads(message.data.decode("utf-8"))
-        print(f"Gmail Payload: {json.dumps(payload, indent=2)}")
-        
-        history_id = payload.get("historyId")
-        
         service = get_gmail_service()
         if not service:
             print("❌ Gmail service not initialized. token.json is missing or invalid.")
-            message.ack()
             return
             
-        # List the latest message
-        results = service.users().messages().list(userId='me', maxResults=1).execute()
+        # FIX 2: Strict filter for Unread emails with Attachments
+        results = service.users().messages().list(userId='me', q="is:unread has:attachment").execute()
         messages = results.get('messages', [])
+        
         if not messages:
-            print("No recent messages found in Gmail.")
-            message.ack()
+            print("Event fired, but no unread resumes found (ignoring text-only emails or ghost webhooks).")
             return
             
+        # Process the first unread matching message
         msg_id = messages[0]['id']
         msg = service.users().messages().get(userId='me', id=msg_id).execute()
         
@@ -214,7 +272,6 @@ def process_pubsub_message(message: pubsub_v1.subscriber.message.Message):
         
         if not attachments:
             print(f"No resume attachments (PDF/DOCX) found in email '{subject}' from {sender}.")
-            message.ack()
             return
             
         target_attachment = attachments[0]
@@ -237,12 +294,10 @@ def process_pubsub_message(message: pubsub_v1.subscriber.message.Message):
                 print(f"👉 Falling back to first available job for evaluation: '{matched_job['name']}' (ID: {matched_job['_id']})")
             else:
                 print("❌ ERROR: No job roles exist in the database at all.")
-                message.ack()
                 return
                 
         if not matched_job.get("jd_text"):
             print(f"❌ ERROR: Job '{matched_job['name']}' has no Job Description text loaded.")
-            message.ack()
             return
             
         # 2. Download the attachment file
@@ -266,16 +321,36 @@ def process_pubsub_message(message: pubsub_v1.subscriber.message.Message):
         with tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".txt", encoding="utf-8") as temp_jd:
             temp_jd.write(matched_job["jd_text"])
             jd_path = temp_jd.name
+
+        # FIX 3: THE IDEMPOTENCY LOCK (Mark as read BEFORE the AI runs)
+        try:
+            service.users().messages().modify(
+                userId='me', 
+                id=msg_id, 
+                body={'removeLabelIds': ['UNREAD']}
+            ).execute()
+            print(f"✅ Email marked as read (safely locked from ghost webhooks).")
+        except Exception as e:
+            print(f"⚠️ Could not mark email as read: {e}")
             
         # 4. Trigger evaluation pipeline
         try:
             print(f"🚀 Triggering Multi-Agent Evaluation Pipeline for candidate {sender}...")
+            # Extract email cleanly from sender header
+            candidate_email = sender
+            if "<" in sender and ">" in sender:
+                candidate_email = sender.split("<")[1].split(">")[0].strip()
+            
+            gcs_uri = upload_resume_to_gcs(resume_path, candidate_email, str(matched_job["_id"]))
+            
             final_state = process_candidate_pipeline(
                 resume_path=resume_path,
                 jd_path=jd_path,
-                job_id=str(matched_job["_id"])
+                job_id=str(matched_job["_id"]),
+                resume_gcs_uri=gcs_uri
             )
             print(f"🏆 Pipeline Run Successful. Candidate: {final_state.get('name')} | Final Decision: {final_state.get('final_decision')}")
+            
         except Exception as eval_err:
             print(f"❌ Evaluation Pipeline Failed: {eval_err}")
         finally:
@@ -286,8 +361,6 @@ def process_pubsub_message(message: pubsub_v1.subscriber.message.Message):
                 
     except Exception as e:
         print(f"❌ Error processing message: {e}")
-        
-    message.ack() # Ensure Google deletes the notification from the queue
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -485,6 +558,100 @@ def update_job_skills(job_id: str, payload: dict):
         {"$set": update_fields}
     )
     
+    # Re-evaluate all candidates under this job_id using updated criteria
+    jd_text = job.get("jd_text")
+    if jd_text:
+        candidates = list(candidates_collection.find({"job_id": job_id}))
+        print(f"Triggering re-evaluation for {len(candidates)} candidates under job {job_id}...")
+        for cand in candidates:
+            # Skip if candidate was rejected by automatic pre-screening
+            if cand.get("miscellaneous_details") == "Skipped due to eligibility filter.":
+                continue
+                
+            try:
+                print(f"Re-evaluating candidate: {cand.get('name')} (ID: {cand.get('_id')})...")
+                
+                # Dynamically generate fallback ats_reasoning_summary if missing/None for existing DB entries
+                ats_summary = cand.get("ats_reasoning_summary")
+                if not ats_summary or str(ats_summary).strip() == "" or ats_summary == "Assessment failed.":
+                    reasoning_text = cand.get("reasoning", "")
+                    if reasoning_text:
+                        print(f"ats_reasoning_summary is missing for {cand.get('name')}. Generating fallback summary using LLM...")
+                        try:
+                            explanation = reasoning_text.split("=== DETAILED MATRIX CALCULATIONS ===")[0].strip()
+                            messages = [
+                                SystemMessage(content="You are a professional technical recruiter. Summarize the following candidate evaluation explanation into a concise 1-2 sentence high-level summary explaining why they got their score (pointing out major strengths or deductions). Keep it clear and direct for a hover tooltip. Do not include detailed calculations or math."),
+                                HumanMessage(content=explanation)
+                            ]
+                            res = fast_llm.invoke(messages)
+                            if isinstance(res.content, list):
+                                ats_summary = "".join([part.get("text", "") if isinstance(part, dict) else str(part) for part in res.content]).strip()
+                            else:
+                                ats_summary = str(res.content).strip()
+                        except Exception as sum_err:
+                            print(f"Failed to generate fallback summary for {cand.get('name')}: {sum_err}")
+                            explanation = reasoning_text.split("=== DETAILED MATRIX CALCULATIONS ===")[0].strip()
+                            sentences = [s.strip() for s in explanation.split(".") if s.strip()]
+                            ats_summary = ". ".join(sentences[:2]) + "." if sentences else "No reasoning summary available."
+                    else:
+                        ats_summary = "No reasoning summary available."
+                    print(f"Generated fallback summary: {ats_summary}")
+
+                # Build minimum state for evaluation
+                eval_state = {
+                    "raw_resume": "",
+                    "jd_text": jd_text,
+                    "matrix_path": None,
+                    "job_id": job_id,
+                    "name": cand.get("name"),
+                    "github_username": cand.get("github_username"),
+                    "email": cand.get("email"),
+                    "phone": cand.get("phone"),
+                    "category": cand.get("category"),
+                    "education": cand.get("education"),
+                    "experience": cand.get("experience"),
+                    "projects": cand.get("projects"),
+                    "skills": cand.get("skills"),
+                    "certifications": cand.get("certifications"),
+                    "github_project_links": cand.get("github_project_links", []),
+                    "miscellaneous_details": cand.get("miscellaneous_details"),
+                    "github_data": cand.get("github_data"),
+                    "project_verification": cand.get("project_verification"),
+                    "score": cand.get("score"),
+                    "reasoning": cand.get("reasoning"),
+                    "ats_reasoning_summary": ats_summary
+                }
+                
+                # Execute evaluator node
+                jd_res = jd_evaluator_node(eval_state)
+                eval_state.update(jd_res)
+                
+                # Execute communicator node
+                comm_res = communicator_node(eval_state)
+                eval_state.update(comm_res)
+                
+                # Update DB
+                update_fields_cand = {
+                    "jd_score": eval_state.get("jd_score"),
+                    "jd_reasoning": eval_state.get("jd_reasoning"),
+                    "jd_reasoning_summary": eval_state.get("jd_reasoning_summary"),
+                    "final_weighted_score": eval_state.get("final_weighted_score"),
+                    "final_decision": eval_state.get("final_decision"),
+                    "candidate_email": eval_state.get("candidate_email"),
+                    "hiring_manager_brief": eval_state.get("hiring_manager_brief"),
+                    "interview_questions": eval_state.get("interview_questions")
+                }
+                if ats_summary:
+                    update_fields_cand["ats_reasoning_summary"] = ats_summary
+                    
+                candidates_collection.update_one(
+                    {"_id": cand["_id"]},
+                    {"$set": update_fields_cand}
+                )
+                print(f"Re-evaluation complete for candidate {cand.get('name')}. New Score: {eval_state.get('final_weighted_score')}")
+            except Exception as eval_err:
+                print(f"Error re-evaluating candidate {cand.get('name')}: {eval_err}")
+                
     response_data = {"status": "success", "skills": formatted_skills}
     response_data.update({k: v for k, v in update_fields.items() if k != "skills"})
     return response_data
@@ -510,14 +677,19 @@ def evaluate_candidate_for_job(job_id: str, resume: UploadFile = File(...)):
             temp_resume.write(resume.file.read())
             resume_path = temp_resume.name
             
-        # Store JD to temp file for read_document_content requirements if needed or pass string directly
-        # Since process_candidate_pipeline requires two paths, we create a temporary file for the stored JD text
         with tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".txt", encoding="utf-8") as temp_jd:
             temp_jd.write(job["jd_text"])
             jd_path = temp_jd.name
 
-        # Trigger shared pipeline logic
-        final_state = process_candidate_pipeline(resume_path, jd_path, job_id=job_id)
+        # Upload file to GCS
+        gcs_uri = upload_resume_to_gcs(resume_path, "manual", job_id)
+        
+        final_state = process_candidate_pipeline(
+            resume_path=resume_path, 
+            jd_path=jd_path, 
+            job_id=job_id, 
+            resume_gcs_uri=gcs_uri
+        )
 
         os.remove(resume_path)
         os.remove(jd_path)
@@ -543,8 +715,12 @@ def evaluate_candidate_endpoint(
             temp_jd.write(jd.file.read())
             jd_path = temp_jd.name
 
-        # Trigger the shared logic block
-        final_state = process_candidate_pipeline(resume_path, jd_path)
+        gcs_uri = upload_resume_to_gcs(resume_path, "manual", "legacy_evaluate")
+        final_state = process_candidate_pipeline(
+            resume_path=resume_path, 
+            jd_path=jd_path, 
+            resume_gcs_uri=gcs_uri
+        )
 
         os.remove(resume_path)
         os.remove(jd_path)
@@ -567,6 +743,45 @@ def get_all_candidates(job_id: Optional[str] = None):
         candidates.append(document)
     return {"candidates": candidates}
 
+@api.get("/api/candidates/{candidate_id}/resume")
+def get_candidate_resume(candidate_id: str):
+    """Serve the GCS private PDF file of a candidate using a temporary V4 Signed URL redirect."""
+    try:
+        cand = candidates_collection.find_one({"_id": ObjectId(candidate_id)})
+        if not cand:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+        
+        resume_gcs_uri = cand.get("resume_gcs_uri")
+        if not resume_gcs_uri:
+            raise HTTPException(status_code=404, detail="Resume GCS URI is missing for this candidate")
+            
+        # Parse gs:// URI into bucket and blob name
+        if not resume_gcs_uri.startswith("gs://"):
+            raise HTTPException(status_code=400, detail="Invalid GCS URI format stored in DB")
+            
+        parts = resume_gcs_uri[5:].split("/", 1)
+        if len(parts) < 2:
+            raise HTTPException(status_code=400, detail="Invalid GCS URI format stored in DB")
+            
+        bucket_name, blob_name = parts[0], parts[1]
+        
+        # Connect to GCS client and generate V4 Signed URL
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        
+        signed_url = blob.generate_signed_url(
+            version="v4",
+            expiration=datetime.timedelta(minutes=15),
+            method="GET"
+        )
+        
+        return RedirectResponse(url=signed_url)
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
+
 @api.patch("/api/candidates/{candidate_id}")
 def update_candidate_status(candidate_id: str, payload: dict):
     """Update candidate properties like final_decision status."""
@@ -587,6 +802,22 @@ def update_candidate_status(candidate_id: str, payload: dict):
             raise HTTPException(status_code=404, detail="Candidate not found.")
             
         return {"status": "success", "final_decision": decision}
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api.delete("/api/job/{job_id}")
+def delete_job(job_id: str):
+    try:
+        result = jobs_collection.delete_one({"_id": ObjectId(job_id)})
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Job Role not found.")
+        
+        # Also clean up all candidates belonging to this job
+        candidates_collection.delete_many({"job_id": job_id})
+        
+        return {"status": "success"}
     except Exception as e:
         if isinstance(e, HTTPException):
             raise e

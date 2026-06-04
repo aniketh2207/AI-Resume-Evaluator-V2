@@ -18,7 +18,10 @@ import {
   ShieldCheck, 
   Check,
   FolderOpen,
-  FolderPlus
+  FolderPlus,
+  FileText,
+  ExternalLink,
+  Trash2
 } from 'lucide-react';
 import axios from 'axios';
 import './App.css';
@@ -96,13 +99,17 @@ interface Candidate {
   project_verification: string;
   score: number;
   reasoning: string;
+  ats_reasoning_summary?: string;
   jd_score: number;
   jd_reasoning: string;
+  jd_reasoning_summary?: string;
   final_weighted_score: number;
   final_decision: string;
   candidate_email: string;
   hiring_manager_brief: string;
   interview_questions: string[];
+  resume_filename?: string;
+  resume_gcs_uri?: string;
 }
 
 interface Job {
@@ -182,8 +189,12 @@ function App() {
   
   // Job Role (Folders) States
   const [jobs, setJobs] = useState<Job[]>([]);
-  const [selectedJobId, setSelectedJobId] = useState<string>("");
+  const [selectedJobId, setSelectedJobId] = useState<string>(() => {
+    return localStorage.getItem("selectedJobId") || "";
+  });
   const [isCreateJobOpen, setIsCreateJobOpen] = useState(false);
+  const [jobToDeleteId, setJobToDeleteId] = useState<string | null>(null);
+  const [evaluationWizardStep, setEvaluationWizardStep] = useState<0 | 1>(0);
   const [newJobName, setNewJobName] = useState("");
   const [isUploadingJd, setIsUploadingJd] = useState(false);
   const jdFileInputRef = useRef<HTMLInputElement>(null);
@@ -196,6 +207,7 @@ function App() {
   const [editingOtherCriteria, setEditingOtherCriteria] = useState<string>("");
   const [skillsSaveError, setSkillsSaveError] = useState<string | null>(null);
   const [isSavingSkills, setIsSavingSkills] = useState(false);
+  const [isInlineSetupSaved, setIsInlineSetupSaved] = useState(false);
 
   // Sidebar Navigation State
   const [activeSidebarTab, setActiveSidebarTab] = useState<string>("dashboard");
@@ -215,6 +227,37 @@ function App() {
 
   const resumeInputRef = useRef<HTMLInputElement>(null);
 
+
+
+  // Save selected job ID to localStorage on change
+  useEffect(() => {
+    if (selectedJobId) {
+      localStorage.setItem("selectedJobId", selectedJobId);
+    } else {
+      localStorage.removeItem("selectedJobId");
+    }
+  }, [selectedJobId]);
+
+  // Synchronize setup state when job is changed
+  useEffect(() => {
+    if (selectedJobId) {
+      const selectedJob = jobs.find(j => j._id === selectedJobId);
+      const jobCandCount = candidates.filter(c => c.job_id === selectedJobId).length;
+      
+      if (jobCandCount > 0) {
+        setIsInlineSetupSaved(true);
+      } else if (selectedJob && selectedJob.jd_filename) {
+        if (selectedJob.skills && selectedJob.skills.length > 0) {
+          setIsInlineSetupSaved(true);
+        } else {
+          setIsInlineSetupSaved(false);
+        }
+      } else {
+        setIsInlineSetupSaved(false);
+      }
+    }
+  }, [selectedJobId, jobs, candidates]);
+
   // Fetch jobs and candidates on mount
   useEffect(() => {
     const fetchInitialData = async () => {
@@ -223,7 +266,13 @@ function App() {
         if (jobsResponse.data && jobsResponse.data.jobs) {
           setJobs(jobsResponse.data.jobs);
           if (jobsResponse.data.jobs.length > 0) {
-            setSelectedJobId(jobsResponse.data.jobs[0]._id);
+            const savedJobId = localStorage.getItem("selectedJobId");
+            const jobExists = jobsResponse.data.jobs.some((j: any) => j._id === savedJobId);
+            if (savedJobId && jobExists) {
+              setSelectedJobId(savedJobId);
+            } else {
+              setSelectedJobId(jobsResponse.data.jobs[0]._id);
+            }
           }
         }
 
@@ -315,6 +364,32 @@ function App() {
     }
   };
 
+  // Delete an existing job role folder and its candidate evaluations
+  const handleDeleteJob = async (jobId: string) => {
+    try {
+      await axios.delete(`http://127.0.0.1:8000/api/job/${jobId}`);
+      
+      const updatedJobs = jobs.filter(j => j._id !== jobId);
+      setJobs(updatedJobs);
+      
+      // Filter out deleted job's candidates from state
+      setCandidates(prev => prev.filter(c => c.job_id !== jobId));
+      
+      // Select first remaining job if available, otherwise clear selection
+      if (updatedJobs.length > 0) {
+        setSelectedJobId(updatedJobs[0]._id);
+      } else {
+        setSelectedJobId("");
+      }
+      
+      // Clear drawer selection
+      setSelectedCandidateId("");
+    } catch (err) {
+      console.error("Failed to delete job:", err);
+      alert("Failed to delete job. Please verify the backend is running and try again.");
+    }
+  };
+
   // Upload Job Description (JD) for the active Job Role folder
   const handleJdUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files || !e.target.files[0] || !selectedJobId) return;
@@ -342,6 +417,18 @@ function App() {
       const updatedJobs = await axios.get("http://127.0.0.1:8000/api/jobs");
       if (updatedJobs.data && updatedJobs.data.jobs) {
         setJobs(updatedJobs.data.jobs);
+        
+        // Find the newly updated job
+        const updatedJob = updatedJobs.data.jobs.find((j: any) => j._id === selectedJobId);
+        if (updatedJob) {
+          // Pre-populate and show inline setup
+          setEditingSkills(updatedJob.skills || []);
+          setEditingGradYears(updatedJob.required_graduation_years?.join(", ") || "");
+          setEditingMinGpa(updatedJob.minimum_gpa !== undefined && updatedJob.minimum_gpa !== null ? String(updatedJob.minimum_gpa) : "");
+          setEditingOtherCriteria(updatedJob.other_eligibility_criteria || "");
+          setSkillsSaveError(null);
+          setIsInlineSetupSaved(false); // Transition to inline weights config pane
+        }
       }
     } catch (err) {
       console.error("Failed to upload JD:", err);
@@ -406,7 +493,135 @@ function App() {
         }
         return j;
       }));
+
+      // Refetch updated candidates to display new scores in UI
+      const candidatesResponse = await axios.get("http://127.0.0.1:8000/api/candidates");
+      if (candidatesResponse.data && candidatesResponse.data.candidates) {
+        const mapped: Candidate[] = candidatesResponse.data.candidates.map((c: any) => {
+          let decision = c.final_decision?.toLowerCase() || "rejected";
+          if (decision === "approved") {
+            decision = "shortlisted";
+          }
+          return {
+            ...c,
+            id: c._id || c.id,
+            final_decision: decision
+          };
+        });
+        setCandidates(mapped);
+      }
+
       setIsSkillsModalOpen(false);
+    } catch (err: any) {
+      console.error(err);
+      setSkillsSaveError(err.response?.data?.detail || "Failed to save skill weights.");
+    } finally {
+      setIsSavingSkills(false);
+    }
+  };
+
+  // Save configured criteria and trigger evaluation pipeline
+  const saveCriteriaAndTriggerEvaluation = async () => {
+    // 1. Validate weights first
+    const total = editingSkills.reduce((sum, s) => sum + s.weight, 0);
+    if (total !== 100) {
+      setApiError("Total skill weights must sum to exactly 100% to run evaluation.");
+      return;
+    }
+
+    const gradYearsArray = editingGradYears
+      .split(",")
+      .map(y => parseInt(y.trim()))
+      .filter(y => !isNaN(y));
+
+    const minGpaValue = editingMinGpa.trim() === "" ? null : parseFloat(editingMinGpa.trim());
+    if (editingMinGpa.trim() !== "" && isNaN(minGpaValue as number)) {
+      setApiError("Minimum GPA must be a valid number or empty.");
+      return;
+    }
+
+    setApiError(null);
+    setIsUploading(true);
+    setUploadStep(0);
+    
+    try {
+      // 2. Save configured parameters to the database
+      await axios.put(`http://127.0.0.1:8000/api/jobs/${selectedJobId}/skills`, {
+        skills: editingSkills,
+        required_graduation_years: gradYearsArray,
+        minimum_gpa: minGpaValue,
+        other_eligibility_criteria: editingOtherCriteria.trim() || null
+      });
+
+      // 3. Update the frontend jobs state in-memory so it stays synchronized
+      setJobs(prev => prev.map(j => {
+        if (j._id === selectedJobId) {
+          return { 
+            ...j, 
+            skills: editingSkills,
+            required_graduation_years: gradYearsArray,
+            minimum_gpa: minGpaValue,
+            other_eligibility_criteria: editingOtherCriteria.trim() || null
+          };
+        }
+        return j;
+      }));
+
+      // 4. Trigger evaluation API
+      await triggerEvaluation();
+    } catch (err: any) {
+      console.error(err);
+      setApiError(err.response?.data?.detail || "Failed to save weights and trigger evaluation.");
+      setIsUploading(false);
+    }
+  };
+
+  const handleSaveWeightsOnly = async () => {
+    // 1. Validate weights first
+    const total = editingSkills.reduce((sum, s) => sum + s.weight, 0);
+    if (total !== 100) {
+      setSkillsSaveError("Total skill weights must sum to exactly 100% to save.");
+      return;
+    }
+
+    const gradYearsArray = editingGradYears
+      .split(",")
+      .map(y => parseInt(y.trim()))
+      .filter(y => !isNaN(y));
+
+    const minGpaValue = editingMinGpa.trim() === "" ? null : parseFloat(editingMinGpa.trim());
+    if (editingMinGpa.trim() !== "" && isNaN(minGpaValue as number)) {
+      setSkillsSaveError("Minimum GPA must be a valid number or empty.");
+      return;
+    }
+
+    setSkillsSaveError(null);
+    setIsSavingSkills(true);
+    
+    try {
+      // 2. Save configured parameters to the database
+      await axios.put(`http://127.0.0.1:8000/api/jobs/${selectedJobId}/skills`, {
+        skills: editingSkills,
+        required_graduation_years: gradYearsArray,
+        minimum_gpa: minGpaValue,
+        other_eligibility_criteria: editingOtherCriteria.trim() || null
+      });
+
+      // 3. Update the frontend jobs state in-memory so it stays synchronized
+      setJobs(prev => prev.map(j => {
+        if (j._id === selectedJobId) {
+          return { 
+            ...j, 
+            skills: editingSkills,
+            required_graduation_years: gradYearsArray,
+            minimum_gpa: minGpaValue,
+            other_eligibility_criteria: editingOtherCriteria.trim() || null
+          };
+        }
+        return j;
+      }));
+
+      setIsInlineSetupSaved(true);
     } catch (err: any) {
       console.error(err);
       setSkillsSaveError(err.response?.data?.detail || "Failed to save skill weights.");
@@ -458,13 +673,17 @@ function App() {
         project_verification: data.project_verification || "No verification logs.",
         score: data.score || 0,
         reasoning: data.reasoning || "",
+        ats_reasoning_summary: data.ats_reasoning_summary || "",
         jd_score: data.jd_score || 0,
         jd_reasoning: data.jd_reasoning || "",
+        jd_reasoning_summary: data.jd_reasoning_summary || "",
         final_weighted_score: data.final_weighted_score || 0,
         final_decision: data.final_decision?.toLowerCase() === "approved" ? "shortlisted" : (data.final_decision?.toLowerCase() || "rejected"),
         candidate_email: data.candidate_email || "",
         hiring_manager_brief: data.hiring_manager_brief || "",
-        interview_questions: data.interview_questions || []
+        interview_questions: data.interview_questions || [],
+        resume_filename: data.resume_filename,
+        resume_gcs_uri: data.resume_gcs_uri
       };
 
       setCandidates((prev) => [newCandidate, ...prev]);
@@ -657,49 +876,69 @@ function App() {
                       <h2 style={{ margin: 0, fontSize: '20px', fontWeight: 600 }}>{selectedJob.name}</h2>
                     </div>
 
-                    {selectedJob.jd_filename ? (
-                      <div style={{ display: 'flex', gap: '12px' }}>
-                        <input 
-                          type="file"
-                          ref={jdFileInputRef}
-                          style={{ display: 'none' }}
-                          accept=".pdf,.docx"
-                          onChange={handleJdUpload}
-                        />
-                        <button 
-                          type="button" 
-                          className="btn-secondary"
-                          style={{ padding: '8px 14px', display: 'flex', alignItems: 'center', gap: '6px' }}
-                          onClick={() => {
-                            setEditingSkills(selectedJob.skills || []);
-                            setEditingGradYears(selectedJob.required_graduation_years?.join(", ") || "");
-                            setEditingMinGpa(selectedJob.minimum_gpa !== undefined && selectedJob.minimum_gpa !== null ? String(selectedJob.minimum_gpa) : "");
-                            setEditingOtherCriteria(selectedJob.other_eligibility_criteria || "");
-                            setSkillsSaveError(null);
-                            setIsSkillsModalOpen(true);
-                          }}
-                        >
-                          <Settings size={14} />
-                          Configure Weights
-                        </button>
-                        <button 
-                          type="button" 
-                          className="btn-secondary"
-                          style={{ padding: '8px 14px' }}
-                          onClick={() => jdFileInputRef.current?.click()}
-                        >
-                          Update JD
-                        </button>
-                        <button 
-                          type="button" 
-                          className="btn-primary" 
-                          onClick={() => setIsUploadOpen(true)}
-                        >
-                          <Plus size={16} />
-                          Evaluate Candidate
-                        </button>
-                      </div>
-                    ) : null}
+                    <div style={{ display: 'flex', gap: '12px' }}>
+                      {selectedJob.jd_filename && (
+                        <>
+                          <input 
+                            type="file"
+                            ref={jdFileInputRef}
+                            style={{ display: 'none' }}
+                            accept=".pdf,.docx"
+                            onChange={handleJdUpload}
+                          />
+                          <button 
+                            type="button" 
+                            className="btn-secondary"
+                            style={{ padding: '8px 14px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                            onClick={() => {
+                              setEditingSkills(selectedJob.skills || []);
+                              setEditingGradYears(selectedJob.required_graduation_years?.join(", ") || "");
+                              setEditingMinGpa(selectedJob.minimum_gpa !== undefined && selectedJob.minimum_gpa !== null ? String(selectedJob.minimum_gpa) : "");
+                              setEditingOtherCriteria(selectedJob.other_eligibility_criteria || "");
+                              setSkillsSaveError(null);
+                              setIsSkillsModalOpen(true);
+                            }}
+                          >
+                            <Settings size={14} />
+                            Configure Weights
+                          </button>
+                          <button 
+                            type="button" 
+                            className="btn-secondary"
+                            style={{ padding: '8px 14px' }}
+                            onClick={() => jdFileInputRef.current?.click()}
+                          >
+                            Update JD
+                          </button>
+                          <button 
+                            type="button" 
+                            className="btn-primary" 
+                            onClick={() => {
+                              setEditingSkills(selectedJob.skills || []);
+                              setEditingGradYears(selectedJob.required_graduation_years?.join(", ") || "");
+                              setEditingMinGpa(selectedJob.minimum_gpa !== undefined && selectedJob.minimum_gpa !== null ? String(selectedJob.minimum_gpa) : "");
+                              setEditingOtherCriteria(selectedJob.other_eligibility_criteria || "");
+                              setEvaluationWizardStep(0);
+                              setApiError(null);
+                              setResumeFile(null);
+                              setIsUploadOpen(true);
+                            }}
+                          >
+                            <Plus size={16} />
+                            Evaluate Candidate
+                          </button>
+                        </>
+                      )}
+                      <button 
+                        type="button" 
+                        className="btn-danger"
+                        style={{ padding: '8px 14px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                        onClick={() => setJobToDeleteId(selectedJob._id)}
+                      >
+                        <Trash2 size={14} />
+                        Delete Job
+                      </button>
+                    </div>
                   </div>
 
                   {!selectedJob.jd_filename ? (
@@ -752,6 +991,299 @@ function App() {
                           </>
                         )}
                       </button>
+                    </div>
+                  ) : totalProcessed === 0 && !isInlineSetupSaved ? (
+                    /* Inline Weights & Criteria Setup View */
+                    <div className="inline-setup-container" style={{
+                      backgroundColor: 'var(--bg-card)',
+                      border: '1px solid var(--border-color)',
+                      borderRadius: '16px',
+                      padding: '30px',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '24px'
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border-color)', paddingBottom: '16px' }}>
+                        <div>
+                          <h3 style={{ margin: '0 0 4px', fontSize: '18px', fontWeight: 600 }}>Configure Screening & Selection Criteria</h3>
+                          <p style={{ margin: 0, fontSize: '13px', color: 'var(--text-secondary)' }}>
+                            Review and adjust the extracted skills, weights, and pre-screening criteria for this job.
+                          </p>
+                        </div>
+                        <button 
+                          type="button" 
+                          className="btn-secondary" 
+                          style={{ padding: '8px 14px' }}
+                          onClick={() => jdFileInputRef.current?.click()}
+                        >
+                          Change JD File
+                        </button>
+                      </div>
+
+                      {skillsSaveError && (
+                        <div style={{ backgroundColor: 'var(--color-error-bg)', border: '1px solid var(--color-error-border)', color: 'var(--color-error)', padding: '12px 16px', borderRadius: '10px', fontSize: '13px' }}>
+                          {skillsSaveError}
+                        </div>
+                      )}
+
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+                        {/* Skills Section */}
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                          <h4 style={{ fontSize: '14px', fontWeight: 600, color: 'var(--text-secondary)', margin: '0' }}>Skill Weights (Must sum to 100%)</h4>
+                          {editingSkills.length === 0 ? (
+                            <div style={{ textAlign: 'center', padding: '24px', color: 'var(--text-muted)', fontSize: '13px', border: '1px dashed var(--border-color)', borderRadius: '8px' }}>
+                              No skills configured. Click "Add Custom Skill" below to define skills.
+                            </div>
+                          ) : (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                              {editingSkills.map((skill, index) => (
+                                <div key={index} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '10px 14px', backgroundColor: 'var(--bg-card-hover)', borderRadius: '10px', border: '1px solid var(--border-color)' }}>
+                                  <input 
+                                    type="text" 
+                                    style={{
+                                      flex: '1.2',
+                                      padding: '6px 10px',
+                                      border: '1px solid var(--border-color)',
+                                      borderRadius: '6px',
+                                      fontSize: '13px',
+                                      color: 'var(--text-primary)',
+                                      backgroundColor: '#FFFFFF',
+                                      minWidth: '100px'
+                                    }}
+                                    value={skill.name}
+                                    onChange={(e) => updateSkillName(index, e.target.value)}
+                                    placeholder="Skill Name"
+                                  />
+                                  
+                                  <div style={{ flex: '2', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                    <input 
+                                      type="range" 
+                                      min="0" 
+                                      max="100" 
+                                      style={{
+                                        flex: 1,
+                                        cursor: 'pointer',
+                                        accentColor: 'var(--color-accent)'
+                                      }}
+                                      value={skill.weight}
+                                      onChange={(e) => updateSkillWeight(index, parseInt(e.target.value))}
+                                    />
+                                    <span style={{ fontSize: '13px', fontWeight: 600, minWidth: '40px', textAlign: 'right', color: 'var(--text-primary)' }}>
+                                      {skill.weight}%
+                                    </span>
+                                  </div>
+
+                                  <button 
+                                    type="button"
+                                    style={{
+                                      padding: '6px',
+                                      borderRadius: '6px',
+                                      border: 'none',
+                                      backgroundColor: 'transparent',
+                                      color: 'var(--text-muted)',
+                                      cursor: 'pointer',
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      justifyContent: 'center'
+                                    }}
+                                    onClick={() => deleteSkill(index)}
+                                    title="Delete Skill"
+                                  >
+                                    <X size={16} />
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '4px' }}>
+                            <button 
+                              type="button"
+                              className="btn-secondary"
+                              style={{ padding: '6px 12px', fontSize: '13px' }}
+                              onClick={addSkill}
+                            >
+                              <Plus size={14} />
+                              Add Custom Skill
+                            </button>
+
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                              <span style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
+                                Total Weight:
+                              </span>
+                              <span 
+                                style={{ 
+                                  fontSize: '15px', 
+                                  fontWeight: 700, 
+                                  color: editingSkills.reduce((sum, s) => sum + s.weight, 0) === 100 ? 'var(--color-success)' : 'var(--color-error)' 
+                                }}
+                              >
+                                {editingSkills.reduce((sum, s) => sum + s.weight, 0)}%
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Pre-Screening Section */}
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', borderTop: '1px solid var(--border-color)', paddingTop: '16px' }}>
+                          <h4 style={{ fontSize: '14px', fontWeight: 600, color: 'var(--text-secondary)', margin: '0' }}>Pre-Screening Eligibility Criteria</h4>
+                          
+                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                              <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-secondary)' }}>Graduation Years (comma separated)</label>
+                              <input 
+                                type="text" 
+                                placeholder="e.g. 2025, 2026"
+                                style={{
+                                  padding: '8px 12px',
+                                  border: '1px solid var(--border-color)',
+                                  borderRadius: '6px',
+                                  fontSize: '13px',
+                                  color: 'var(--text-primary)',
+                                  backgroundColor: '#FFFFFF',
+                                }}
+                                value={editingGradYears}
+                                onChange={(e) => setEditingGradYears(e.target.value)}
+                              />
+                            </div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                              <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-secondary)' }}>Minimum GPA</label>
+                              <input 
+                                type="text" 
+                                placeholder="e.g. 3.0"
+                                style={{
+                                  padding: '8px 12px',
+                                  border: '1px solid var(--border-color)',
+                                  borderRadius: '6px',
+                                  fontSize: '13px',
+                                  color: 'var(--text-primary)',
+                                  backgroundColor: '#FFFFFF',
+                                }}
+                                value={editingMinGpa}
+                                onChange={(e) => setEditingMinGpa(e.target.value)}
+                              />
+                            </div>
+                          </div>
+
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                            <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-secondary)' }}>Other Eligibility requirements (work authorization, etc.)</label>
+                            <textarea 
+                              placeholder="e.g. Must be currently authorized to work in the US without visa sponsorship."
+                              style={{
+                                padding: '8px 12px',
+                                border: '1px solid var(--border-color)',
+                                borderRadius: '6px',
+                                fontSize: '13px',
+                                color: 'var(--text-primary)',
+                                backgroundColor: '#FFFFFF',
+                                resize: 'vertical',
+                                height: '60px',
+                                fontFamily: 'inherit'
+                              }}
+                              value={editingOtherCriteria}
+                              onChange={(e) => setEditingOtherCriteria(e.target.value)}
+                            />
+                          </div>
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end', marginTop: '12px', borderTop: '1px solid var(--border-color)', paddingTop: '16px' }}>
+                        <button 
+                          type="button" 
+                          className="btn-primary" 
+                          disabled={isSavingSkills || editingSkills.reduce((sum, s) => sum + s.weight, 0) !== 100}
+                          onClick={handleSaveWeightsOnly}
+                          style={{ padding: '10px 20px', fontSize: '14px', display: 'flex', alignItems: 'center', gap: '8px' }}
+                        >
+                          {isSavingSkills ? (
+                            <>
+                              <Loader2 className="spinner-icon" size={16} />
+                              Saving Setup...
+                            </>
+                          ) : (
+                            <>
+                              <Check size={16} />
+                              Save Weights & Setup Job
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  ) : totalProcessed === 0 && isInlineSetupSaved ? (
+                    /* Inline Resume Upload Landing Page View */
+                    <div style={{
+                      flex: 1,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      border: '2px dashed var(--border-hover)',
+                      backgroundColor: 'var(--bg-card)',
+                      borderRadius: '16px',
+                      padding: '50px 40px',
+                      textAlign: 'center',
+                      gap: '20px'
+                    }}>
+                      <div style={{
+                        width: '64px',
+                        height: '64px',
+                        borderRadius: '50%',
+                        backgroundColor: 'var(--color-success-bg)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        color: 'var(--color-success)',
+                        marginBottom: '8px'
+                      }}>
+                        <CheckCircle2 size={36} />
+                      </div>
+                      <div>
+                        <h3 style={{ margin: '0 0 6px', fontSize: '20px', fontWeight: 600 }}>Job Setup Complete!</h3>
+                        <p style={{ margin: '0 0 16px', fontSize: '14px', color: 'var(--text-secondary)', maxWidth: '420px', lineHeight: 1.5 }}>
+                          Job Description weights and screening criteria are successfully saved. Now, evaluate applicant resumes to start compiling scores.
+                        </p>
+                      </div>
+
+                      {/* Dropzone or button to run evaluation */}
+                      <input 
+                        type="file" 
+                        ref={resumeInputRef} 
+                        style={{ display: 'none' }} 
+                        accept=".pdf,.docx" 
+                        onChange={(e) => {
+                          if (e.target.files && e.target.files[0]) {
+                            setResumeFile(e.target.files[0]);
+                            setEvaluationWizardStep(0);
+                            setApiError(null);
+                            setIsUploadOpen(true);
+                          }
+                        }}
+                      />
+                      <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                        <button 
+                          type="button" 
+                          className="btn-primary"
+                          style={{ padding: '12px 24px', fontSize: '14px', fontWeight: 600 }}
+                          onClick={() => resumeInputRef.current?.click()}
+                        >
+                          <Upload size={16} />
+                          Upload Applicant Resume
+                        </button>
+                        <button 
+                          type="button" 
+                          className="btn-secondary"
+                          style={{ padding: '12px 18px', fontSize: '14px' }}
+                          onClick={() => {
+                            setEditingSkills(selectedJob.skills || []);
+                            setEditingGradYears(selectedJob.required_graduation_years?.join(", ") || "");
+                            setEditingMinGpa(selectedJob.minimum_gpa !== undefined && selectedJob.minimum_gpa !== null ? String(selectedJob.minimum_gpa) : "");
+                            setEditingOtherCriteria(selectedJob.other_eligibility_criteria || "");
+                            setIsInlineSetupSaved(false);
+                          }}
+                        >
+                          Configure Weights
+                        </button>
+                      </div>
                     </div>
                   ) : (
                     /* Active Folder Evaluations view */
@@ -877,6 +1409,7 @@ function App() {
                                   <th>JD Score</th>
                                   <th>Weighted Final</th>
                                   <th>Status</th>
+                                  <th>View PDF</th>
                                 </tr>
                               </thead>
                               <tbody>
@@ -894,11 +1427,21 @@ function App() {
                                         </div>
                                       </td>
                                       <td>
-                                        <span style={{ fontWeight: 500 }}>{candidate.score}</span>
+                                        <div className="tooltip-wrapper">
+                                          <span style={{ fontWeight: 500 }}>{candidate.score}</span>
+                                          <span className="tooltip-text">
+                                            {candidate.ats_reasoning_summary || "No reasoning summary available."}
+                                          </span>
+                                        </div>
                                         <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>/100</span>
                                       </td>
                                       <td>
-                                        <span style={{ fontWeight: 500 }}>{candidate.jd_score}</span>
+                                        <div className="tooltip-wrapper">
+                                          <span style={{ fontWeight: 500 }}>{candidate.jd_score}</span>
+                                          <span className="tooltip-text">
+                                            {candidate.jd_reasoning_summary || "No reasoning summary available."}
+                                          </span>
+                                        </div>
                                         <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>/100</span>
                                       </td>
                                       <td>
@@ -962,11 +1505,51 @@ function App() {
                                           </span>
                                         )}
                                       </td>
+                                      <td onClick={(e) => e.stopPropagation()}>
+                                        {(candidate.resume_filename || candidate.resume_gcs_uri) ? (
+                                          <a
+                                            href={`http://127.0.0.1:8000/api/candidates/${candidate.id}/resume`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            title="View PDF Resume"
+                                            style={{
+                                              display: 'inline-flex',
+                                              alignItems: 'center',
+                                              gap: '6px',
+                                              fontSize: '12px',
+                                              fontWeight: 600,
+                                              textDecoration: 'none',
+                                              padding: '6px 12px',
+                                              borderRadius: '8px',
+                                              backgroundColor: 'rgba(239, 68, 68, 0.08)',
+                                              color: '#EF4444',
+                                              border: '1px solid rgba(239, 68, 68, 0.2)',
+                                              cursor: 'pointer',
+                                              transition: 'all 0.2s',
+                                            }}
+                                            onMouseEnter={(e) => {
+                                              e.currentTarget.style.backgroundColor = 'rgba(239, 68, 68, 0.15)';
+                                              e.currentTarget.style.borderColor = 'rgba(239, 68, 68, 0.3)';
+                                              e.currentTarget.style.transform = 'translateY(-1px)';
+                                            }}
+                                            onMouseLeave={(e) => {
+                                              e.currentTarget.style.backgroundColor = 'rgba(239, 68, 68, 0.08)';
+                                              e.currentTarget.style.borderColor = 'rgba(239, 68, 68, 0.2)';
+                                              e.currentTarget.style.transform = 'none';
+                                            }}
+                                          >
+                                            <FileText size={13} />
+                                            <span>PDF</span>
+                                          </a>
+                                        ) : (
+                                          <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>N/A</span>
+                                        )}
+                                      </td>
                                     </tr>
                                   ))
                                 ) : (
                                   <tr>
-                                    <td colSpan={5} style={{ textAlign: 'center', padding: '32px', color: 'var(--text-secondary)' }}>
+                                    <td colSpan={6} style={{ textAlign: 'center', padding: '32px', color: 'var(--text-secondary)' }}>
                                       No candidate evaluations listed under this job role folder.
                                     </td>
                                   </tr>
@@ -1079,9 +1662,11 @@ function App() {
                                       <span>Hiring Manager Brief</span>
                                     </div>
                                     <div className="brief-content" style={{ fontSize: '13px', lineHeight: 1.5 }}>
-                                      {selectedCandidate.hiring_manager_brief}
+                                      {renderMarkdown(selectedCandidate.hiring_manager_brief)}
                                     </div>
                                   </div>
+
+
 
                                   <div className="detail-card" style={{ padding: '20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px' }}>
                                     <div style={{ display: 'flex', gap: '16px', width: '100%', justifyContent: 'space-around', alignItems: 'center' }}>
@@ -1537,14 +2122,63 @@ function App() {
         </div>
       )}
 
+      {/* Delete Job Confirmation Modal Overlay */}
+      {jobToDeleteId && (
+        <div className="modal-backdrop">
+          <div className="upload-modal" style={{ width: '400px', padding: '24px' }}>
+            <div className="modal-header">
+              <h2 style={{ color: 'var(--color-error)' }}>Delete Job Role</h2>
+              <div className="modal-close" onClick={() => setJobToDeleteId(null)}>
+                <X size={18} />
+              </div>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', marginTop: '8px' }}>
+              <p style={{ margin: 0, fontSize: '14px', lineHeight: 1.5, color: 'var(--text-secondary)' }}>
+                Are you sure you want to delete the job role <strong>"{jobs.find(j => j._id === jobToDeleteId)?.name}"</strong>?
+              </p>
+              <div style={{ padding: '12px', borderRadius: '8px', backgroundColor: 'var(--color-error-bg)', border: '1px dashed var(--color-error-border)' }}>
+                <p style={{ margin: 0, fontSize: '12px', lineHeight: 1.4, color: 'var(--color-error)', fontWeight: 500 }}>
+                  ⚠️ Warning: This will permanently delete the job description and all associated candidate evaluations. This action cannot be undone.
+                </p>
+              </div>
+              <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end', marginTop: '12px' }}>
+                <button 
+                  type="button" 
+                  className="btn-secondary" 
+                  onClick={() => setJobToDeleteId(null)}
+                >
+                  Cancel
+                </button>
+                <button 
+                  type="button" 
+                  className="btn-danger-solid"
+                  onClick={async () => {
+                    const id = jobToDeleteId;
+                    setJobToDeleteId(null);
+                    await handleDeleteJob(id);
+                  }}
+                >
+                  Delete Permanently
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Evaluate Candidate Resume Modal Overlay */}
       {isUploadOpen && selectedJob && (
         <div className="modal-backdrop">
-          <div className="upload-modal">
+          <div className="upload-modal" style={{ width: evaluationWizardStep === 1 && !isUploading ? '560px' : '520px', transition: 'width 0.3s ease-in-out' }}>
             <div className="modal-header">
               <div>
-                <h2>Evaluate Applicant Resume</h2>
-                <p>Upload candidate resume to run evaluation in folder: <strong>{selectedJob.name}</strong></p>
+                <h2>{evaluationWizardStep === 0 ? "Evaluate Applicant Resume" : "Configure Screening Criteria"}</h2>
+                <p>
+                  {evaluationWizardStep === 0 
+                    ? "Upload candidate resume to run evaluation in folder: " 
+                    : "Customize skills evaluation and eligibility criteria for: "}
+                  <strong>{selectedJob.name}</strong>
+                </p>
               </div>
               <div className="modal-close" onClick={() => !isUploading && setIsUploadOpen(false)}>
                 <X size={20} />
@@ -1576,7 +2210,7 @@ function App() {
                   })}
                 </div>
               </div>
-            ) : (
+            ) : evaluationWizardStep === 0 ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
                 {apiError && (
                   <div style={{ backgroundColor: 'var(--color-error-bg)', border: '1px solid var(--color-error-border)', color: 'var(--color-error)', padding: '12px 16px', borderRadius: '10px', fontSize: '13px' }}>
@@ -1622,9 +2256,218 @@ function App() {
                   </button>
                   <button 
                     type="button" 
+                    className="btn-secondary" 
+                    disabled={!resumeFile}
+                    onClick={() => {
+                      setEditingSkills(selectedJob.skills || []);
+                      setEditingGradYears(selectedJob.required_graduation_years?.join(", ") || "");
+                      setEditingMinGpa(selectedJob.minimum_gpa !== undefined && selectedJob.minimum_gpa !== null ? String(selectedJob.minimum_gpa) : "");
+                      setEditingOtherCriteria(selectedJob.other_eligibility_criteria || "");
+                      setEvaluationWizardStep(1);
+                    }}
+                  >
+                    Configure weights
+                  </button>
+                  <button 
+                    type="button" 
                     className="btn-primary" 
                     disabled={!resumeFile}
                     onClick={triggerEvaluation}
+                  >
+                    Run Evaluation
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+                {apiError && (
+                  <div style={{ backgroundColor: 'var(--color-error-bg)', border: '1px solid var(--color-error-border)', color: 'var(--color-error)', padding: '12px 16px', borderRadius: '10px', fontSize: '13px' }}>
+                    {apiError}
+                  </div>
+                )}
+
+                <p style={{ margin: 0, fontSize: '13px', color: 'var(--text-secondary)' }}>
+                  Review and customize the skills evaluation weights and eligibility criteria extracted from the Job Description before running candidate screening.
+                </p>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '20px', maxHeight: '320px', overflowY: 'auto', paddingRight: '4px' }}>
+                  {/* Skills Section */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                    <h3 style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-secondary)', margin: '0' }}>Skill Weights</h3>
+                    {editingSkills.length === 0 ? (
+                      <div style={{ textAlign: 'center', padding: '24px', color: 'var(--text-muted)', fontSize: '13px', border: '1px dashed var(--border-color)', borderRadius: '8px' }}>
+                        No skills configured. Click "Add Custom Skill" below to define skills.
+                      </div>
+                    ) : (
+                      editingSkills.map((skill, index) => (
+                        <div key={index} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '10px 14px', backgroundColor: 'var(--bg-card-hover)', borderRadius: '10px', border: '1px solid var(--border-color)' }}>
+                          <input 
+                            type="text" 
+                            style={{
+                              flex: '1.2',
+                              padding: '6px 10px',
+                              border: '1px solid var(--border-color)',
+                              borderRadius: '6px',
+                              fontSize: '13px',
+                              color: 'var(--text-primary)',
+                              backgroundColor: '#FFFFFF',
+                              minWidth: '100px'
+                            }}
+                            value={skill.name}
+                            onChange={(e) => updateSkillName(index, e.target.value)}
+                            placeholder="Skill Name"
+                          />
+                          
+                          <div style={{ flex: '2', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <input 
+                              type="range" 
+                              min="0" 
+                              max="100" 
+                              style={{
+                                flex: 1,
+                                cursor: 'pointer',
+                                accentColor: 'var(--color-accent)'
+                              }}
+                              value={skill.weight}
+                              onChange={(e) => updateSkillWeight(index, parseInt(e.target.value))}
+                            />
+                            <span style={{ fontSize: '13px', fontWeight: 600, minWidth: '40px', textAlign: 'right', color: 'var(--text-primary)' }}>
+                              {skill.weight}%
+                            </span>
+                          </div>
+
+                          <button 
+                            type="button"
+                            style={{
+                              padding: '6px',
+                              borderRadius: '6px',
+                              border: 'none',
+                              backgroundColor: 'transparent',
+                              color: 'var(--text-muted)',
+                              cursor: 'pointer',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center'
+                            }}
+                            onClick={() => deleteSkill(index)}
+                            title="Delete Skill"
+                          >
+                            <X size={16} />
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+
+                  {/* Pre-Screening Section */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', borderTop: '1px solid var(--border-color)', paddingTop: '16px' }}>
+                    <h3 style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-secondary)', margin: '0' }}>Pre-Screening Eligibility Criteria</h3>
+                    
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                        <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-secondary)' }}>Graduation Years (comma separated)</label>
+                        <input 
+                          type="text" 
+                          placeholder="e.g. 2025, 2026"
+                          style={{
+                            padding: '8px 12px',
+                            border: '1px solid var(--border-color)',
+                            borderRadius: '6px',
+                            fontSize: '13px',
+                            color: 'var(--text-primary)',
+                            backgroundColor: '#FFFFFF',
+                          }}
+                          value={editingGradYears}
+                          onChange={(e) => setEditingGradYears(e.target.value)}
+                        />
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                        <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-secondary)' }}>Minimum GPA</label>
+                        <input 
+                          type="text" 
+                          placeholder="e.g. 3.0"
+                          style={{
+                            padding: '8px 12px',
+                            border: '1px solid var(--border-color)',
+                            borderRadius: '6px',
+                            fontSize: '13px',
+                            color: 'var(--text-primary)',
+                            backgroundColor: '#FFFFFF',
+                          }}
+                          value={editingMinGpa}
+                          onChange={(e) => setEditingMinGpa(e.target.value)}
+                        />
+                      </div>
+                    </div>
+
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                      <label style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-secondary)' }}>Other Eligibility requirements (work authorization, etc.)</label>
+                      <textarea 
+                        placeholder="e.g. Must be currently authorized to work in the US without visa sponsorship."
+                        style={{
+                          padding: '8px 12px',
+                          border: '1px solid var(--border-color)',
+                          borderRadius: '6px',
+                          fontSize: '13px',
+                          color: 'var(--text-primary)',
+                          backgroundColor: '#FFFFFF',
+                          resize: 'vertical',
+                          height: '60px',
+                          fontFamily: 'inherit'
+                        }}
+                        value={editingOtherCriteria}
+                        onChange={(e) => setEditingOtherCriteria(e.target.value)}
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: '1px solid var(--border-color)', paddingTop: '16px' }}>
+                  <button 
+                    type="button"
+                    className="btn-secondary"
+                    style={{ padding: '8px 12px', fontSize: '13px' }}
+                    onClick={addSkill}
+                  >
+                    <Plus size={14} />
+                    Add Custom Skill
+                  </button>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    <span style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
+                      Total Weight:
+                    </span>
+                    <span 
+                      style={{ 
+                        fontSize: '15px', 
+                        fontWeight: 700, 
+                        color: editingSkills.reduce((sum, s) => sum + s.weight, 0) === 100 ? 'var(--color-success)' : 'var(--color-error)' 
+                      }}
+                    >
+                      {editingSkills.reduce((sum, s) => sum + s.weight, 0)}%
+                    </span>
+                  </div>
+                </div>
+
+                {editingSkills.reduce((sum, s) => sum + s.weight, 0) !== 100 && (
+                  <span style={{ fontSize: '12px', color: 'var(--color-error)', alignSelf: 'flex-end', marginTop: '-12px' }}>
+                    * Weights must sum to exactly 100% to save.
+                  </span>
+                )}
+
+                <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end', marginTop: '12px' }}>
+                  <button 
+                    type="button" 
+                    className="btn-secondary" 
+                    onClick={() => setEvaluationWizardStep(0)}
+                  >
+                    Back
+                  </button>
+                  <button 
+                    type="button" 
+                    className="btn-primary" 
+                    disabled={editingSkills.reduce((sum, s) => sum + s.weight, 0) !== 100}
+                    onClick={saveCriteriaAndTriggerEvaluation}
                   >
                     <Sparkles size={14} />
                     Run Agent Pipeline
@@ -1842,7 +2685,7 @@ function App() {
                 ) : (
                   <>
                     <Check size={14} />
-                    Save Weights
+                    {candidates.filter(c => c.job_id === selectedJobId).length === 0 ? "Save Weights" : "Re-Evaluate"}
                   </>
                 )}
               </button>

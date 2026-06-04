@@ -1,5 +1,5 @@
 langchain
-langchain-google-genai
+langchain-google-vertexai
 langgraph
 pdf2image
 pydantic
@@ -7,3 +7,4 @@ python-dotenv
 pandas
 openpyxl
 tabulate
+google-cloud-storage

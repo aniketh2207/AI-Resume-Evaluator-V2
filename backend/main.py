@@ -5,7 +5,7 @@ from typing import TypedDict, Optional, List
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_vertexai import ChatVertexAI
 from extractor import extract_candidate_info, CandidateInfo, read_document_content
 from langgraph.graph import StateGraph, START, END
 from tools import run_github_agent, GitHubReport
@@ -37,6 +37,7 @@ class ATS_State(TypedDict):
     projects: Optional[list]
     skills: Optional[list]
     certifications: Optional[list]
+    github_project_links: Optional[list]
     miscellaneous_details: Optional[str]
     
     # Live data & verification
@@ -46,13 +47,17 @@ class ATS_State(TypedDict):
     # Score reports
     score: Optional[int]          # The Excel Matrix Base Score
     reasoning: Optional[str]
+    ats_reasoning_summary: Optional[str]
     jd_score: Optional[int]       # The JD Fit Score
     jd_reasoning: Optional[str]
+    jd_reasoning_summary: Optional[str]
     final_weighted_score: Optional[float] # The combined math
     final_decision: Optional[str]
     candidate_email: Optional[str]
     hiring_manager_brief: Optional[str]
     interview_questions: Optional[list[str]]
+    resume_filename: Optional[str]
+    resume_gcs_uri: Optional[str]
 
 class SkillScore(BaseModel):
     name: str = Field(description="The name of the core technical skill being evaluated.")
@@ -62,6 +67,7 @@ class JDFitResult(BaseModel):
     detailed_match_analysis: str = Field(description="Step-by-step detailed matching analysis comparing the candidate's skills, experience, and projects against each specific JD requirement (mandatory, good-to-have, and responsibilities). Identify exact matches, partial matches, and gaps first.")
     skills_scores: List[SkillScore] = Field(description="The match score out of 100 for each of the requested job skills.")
     reasoning: str = Field(description="Concise reasoning for the scores.")
+    jd_reasoning_summary: str = Field(description="A concise, 1-2 sentence high-level summary explaining precisely why the candidate received this JD fit score based on their tech stack match. This will be shown on hover.")
 
 class FinalDeliverables(BaseModel):
     candidate_email: str = Field(description="A personalized email to the candidate regarding the next steps or rejection.")
@@ -79,8 +85,19 @@ class JDSkillsExtraction(BaseModel):
     skills: List[ExtractedSkill] = Field(description="A list of 4 to 8 primary technical skills extracted from the job description.")
 
 # Model Tiering Setup
-fast_llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", temperature=0)
-heavy_llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", temperature=0) # Changed from gemini-3.5-flash (quota exceeded 21/20 daily limit)
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "E:/AI-Resume-Evaluator-V2/backend/ai-resume-evaluator-498012-305d5547940c.json"
+fast_llm = ChatVertexAI(
+    model_name="gemini-2.5-flash",
+    project="ai-resume-evaluator-498012",
+    location="us-central1",
+    temperature=0
+)
+heavy_llm = ChatVertexAI(
+    model_name="gemini-2.5-pro",
+    project="ai-resume-evaluator-498012",
+    location="us-central1",
+    temperature=0
+)
 
 # Backward compatibility binding
 llm = fast_llm
@@ -98,6 +115,7 @@ def extractor_node(state: ATS_State):
         education_list = [edu.model_dump() for edu in info.education]
         experience_list = [exp.model_dump() for exp in info.experience]
         projects_list = [proj.model_dump() for proj in info.projects]
+        github_project_links_list = [link.model_dump() for link in info.github_project_links] if info.github_project_links else []
         
         return {
             "name": info.name,
@@ -110,6 +128,7 @@ def extractor_node(state: ATS_State):
             "projects": projects_list,
             "skills": info.skills,
             "certifications": info.certifications,
+            "github_project_links": github_project_links_list,
             "miscellaneous_details": info.miscellaneous_details
         }
     except Exception as e:
@@ -125,34 +144,41 @@ def extractor_node(state: ATS_State):
             "projects": [],
             "skills": [],
             "certifications": [],
+            "github_project_links": [],
             "miscellaneous_details": f"Extraction failed: {str(e)}"
         }
     
 def github_node(state: ATS_State):
     username = state.get("github_username")
+    project_links = state.get("github_project_links")
     
-    # Guard against missing, null, or placeholder usernames
-    if not username or str(username).strip().lower() in ["null", "none", "na", "n/a", ""]:
-        print("No GitHub username found or provided. Skipping GitHub investigation.")
+    has_username = username and str(username).strip().lower() not in ["null", "none", "na", "n/a", ""]
+    has_links = project_links and len(project_links) > 0
+    
+    if not has_username and not has_links:
+        print("No GitHub username or repo links found. Skipping GitHub investigation.")
         return {
             "github_username": None,
             "github_data": {
                 "name": "N/A",
                 "total_public_repositories": 0,
                 "account_created": "N/A",
-                "bio": "No GitHub profile provided",
+                "bio": "No GitHub profile or repository links provided",
                 "recent_projects": []
             }
         }
         
-    print(f"Investigating Github for user {username}....")
+    print(f"Investigating GitHub. Username: {username or 'N/A'}, Repo Links Count: {len(project_links) if project_links else 0}....")
     try:
         project_titles = []
         if state.get("projects"):
             project_titles = [proj.get("title", "") for proj in state["projects"] if proj.get("title")]
             
-        # Calling the tools.py agent
-        github_report: GitHubReport = run_github_agent(username, project_titles)
+        github_report: GitHubReport = run_github_agent(
+            username=username if has_username else None,
+            projects_to_verify=project_titles,
+            github_project_links=project_links
+        )
         return {
             "github_data": github_report.model_dump()
         }
@@ -160,7 +186,7 @@ def github_node(state: ATS_State):
         print(f"Error during GitHub investigation: {str(e)}")
         return {
             "github_data": {
-                "name": username,
+                "name": username or "N/A",
                 "total_public_repositories": 0,
                 "account_created": "Unknown",
                 "bio": f"Investigation failed: {str(e)}",
@@ -170,7 +196,7 @@ def github_node(state: ATS_State):
 
 def project_verification_node(state: ATS_State):
     username = state.get("github_username")
-    if not username or not state.get("projects") or not state.get("github_data") or not state["github_data"].get("recent_projects"):
+    if not state.get("projects") or not state.get("github_data") or not state["github_data"].get("recent_projects"):
         print("Bypassing Project Verification (no GitHub profile or repositories)...")
         return {
             "project_verification": "Project Verification skipped: No GitHub profile or repositories retrieved."
@@ -195,7 +221,7 @@ def project_verification_node(state: ATS_State):
             
             HumanMessage(content=f"""
             Candidate Name: {state['name']}
-            GitHub Username: {username}
+            GitHub Username: {username or 'N/A'}
             
             Projects Claimed in Resume:
             {json.dumps(state['projects'], indent=2)}
@@ -217,6 +243,8 @@ def project_verification_node(state: ATS_State):
 def student_node(state: ATS_State):
     print("Candidate is a student, evaluating against Student Matrix...")
     excel_path = state.get("matrix_path") or "Profile Completion&Strength.xlsx"
+    if not os.path.isabs(excel_path):
+        excel_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), excel_path)
     try:
         matrix = load_scoring_matrix(excel_path, sheet_name="Student_CareerScapeScore")
         result = evaluate_candidate(
@@ -234,12 +262,13 @@ def student_node(state: ATS_State):
             f"=== DETAILED MATRIX CALCULATIONS ===\n"
             f"{result.detailed_calculations}\n\n"
             f"=== SCORING BREAKDOWN ===\n"
-            f"{json.dumps(result.scoring_breakdown, indent=2)}"
+            f"{json.dumps(result.scoring_breakdown.model_dump(), indent=2)}"
         )
         
         return {
             "score": result.score,
             "reasoning": formatted_reasoning,
+            "ats_reasoning_summary": result.ats_reasoning_summary,
             "final_decision": result.decision,
             "jd_score": None,
             "jd_reasoning": "No JD provided" if not state.get("jd_text") else None,
@@ -250,6 +279,7 @@ def student_node(state: ATS_State):
         return {
             "score": 0,
             "reasoning": f"Assessment failed: {str(e)}",
+            "ats_reasoning_summary": "Assessment failed.",
             "final_decision": "rejected",
             "jd_score": None,
             "jd_reasoning": "Assessment failed",
@@ -259,6 +289,8 @@ def student_node(state: ATS_State):
 def experienced_node(state: ATS_State):
     print("Candidate is experienced, evaluating against Experienced Matrix...")
     excel_path = state.get("matrix_path") or "Profile Completion&Strength.xlsx"
+    if not os.path.isabs(excel_path):
+        excel_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), excel_path)
     try:
         matrix = load_scoring_matrix(excel_path, sheet_name="Expereinced Candidate")
         result = evaluate_candidate(
@@ -276,12 +308,13 @@ def experienced_node(state: ATS_State):
             f"=== DETAILED MATRIX CALCULATIONS ===\n"
             f"{result.detailed_calculations}\n\n"
             f"=== SCORING BREAKDOWN ===\n"
-            f"{json.dumps(result.scoring_breakdown, indent=2)}"
+            f"{json.dumps(result.scoring_breakdown.model_dump(), indent=2)}"
         )
         
         return {
             "score": result.score,
             "reasoning": formatted_reasoning,
+            "ats_reasoning_summary": result.ats_reasoning_summary,
             "final_decision": result.decision,
             "jd_score": None,
             "jd_reasoning": "No JD provided" if not state.get("jd_text") else None,
@@ -292,6 +325,7 @@ def experienced_node(state: ATS_State):
         return {
             "score": 0,
             "reasoning": f"Assessment failed: {str(e)}",
+            "ats_reasoning_summary": "Assessment failed.",
             "final_decision": "rejected",
             "jd_score": None,
             "jd_reasoning": "Assessment failed",
@@ -419,6 +453,7 @@ def jd_evaluator_node(state: ATS_State):
         return {
             "jd_score": jd_score,
             "jd_reasoning": formatted_jd_reasoning,
+            "jd_reasoning_summary": result.jd_reasoning_summary,
             "final_weighted_score": final_score,
             "final_decision": decision
         }
@@ -427,6 +462,7 @@ def jd_evaluator_node(state: ATS_State):
         return {
             "jd_score": 0,
             "jd_reasoning": f"JD evaluation failed: {str(e)}",
+            "jd_reasoning_summary": "JD evaluation failed.",
             "final_weighted_score": 0.0,
             "final_decision": "rejected"
         }

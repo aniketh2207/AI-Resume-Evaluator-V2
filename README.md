@@ -35,26 +35,26 @@ graph TD
 ### The Multi-Agent Pipeline (The Committee)
 
 1. **Agent 1: The Gatekeeper / Extractor (Vision & Extraction)**
-   * **Location**: [extractor.py](file:///e:/AI-Resume-Evaluator-V2/extractor.py#L9-L48)
+   * **Location**: [backend/extractor.py](file:///e:/AI-Resume-Evaluator-V2/backend/extractor.py)
    * **Role**: Reads the raw resume image to bypass formatting/column bugs, extracting metadata (name, GitHub username, category: student/experienced).
 
 2. **Agent 2: The Investigator (External Verification)**
-   * **Location**: [tools.py](file:///e:/AI-Resume-Evaluator-V2/tools.py#L131-L160)
+   * **Location**: [backend/tools.py](file:///e:/AI-Resume-Evaluator-V2/backend/tools.py)
    * **Role**: Fact-checks and retrieves live statistics using LangChain Tool Calling.
    * **Task**: Hits the public GitHub API to verify repos, languages, stars, and activity metrics.
 
 3. **Agent 3S/3E: The Technical Assessor (Semantic Matrix Scoring)**
-   * **Location**: [assessor.py](file:///e:/AI-Resume-Evaluator-V2/assessor.py#L29-L70)
+   * **Location**: [backend/assessor.py](file:///e:/AI-Resume-Evaluator-V2/backend/assessor.py)
    * **Role**: Computes matrix scoring based on experience classification.
    * **Task**: Reads rules directly from `Profile Completion&Strength.xlsx` (sheets `Student_CareerScapeScore` or `Expereinced Candidate`) via pandas, evaluating components (GPA, certifications, internships, projects, etc.). The final matrix score is programmatically calculated in Python to prevent LLM math errors.
 
 4. **Agent 4: The Judge (Job Description Evaluator)**
-   * **Location**: [main.py](file:///e:/AI-Resume-Evaluator-V2/main.py#L129-L168)
+   * **Location**: [backend/main.py](file:///e:/AI-Resume-Evaluator-V2/backend/main.py)
    * **Role**: Cross-references the candidate's resume & GitHub data against the Job Description.
    * **Task**: Utilizes **Chain-of-Thought (CoT)** reasoning (ordered first in Pydantic schema) to compare candidate details against JD requirements before determining a JD fit score.
 
 5. **Agent 5: The HR Communicator (Final Deliverables)**
-   * **Location**: [main.py](file:///e:/AI-Resume-Evaluator-V2/main.py#L170-L202)
+   * **Location**: [backend/main.py](file:///e:/AI-Resume-Evaluator-V2/backend/main.py)
    * **Role**: Synthesizes output assets.
    * **Task**: Drafts a personalized candidate email (encouraging next steps if approved, polite rejection if not), a concise technical brief for hiring managers, and 3 tailored technical interview questions based on candidate projects and the JD.
 
@@ -116,24 +116,38 @@ pip install -r requirements.txt
 ```
 
 ### 4. Set Environment Variables
-Create a `.env` file in the root directory:
+Create a `.env` file in the `backend` directory:
 ```env
-GOOGLE_API_KEY=your-gemini-api-key-here
-GITHUB_TOKEN=your-optional-github-token-here
+MONGODB_URL="your-mongodb-connection-string"
+GITHUB_TOKEN="your-optional-github-token"
 ```
+
 > [!NOTE]
-> `GITHUB_TOKEN` is optional but highly recommended to prevent GitHub API rate-limiting during candidate verification.
+> * `GOOGLE_APPLICATION_CREDENTIALS` is dynamically referenced inside `server.py` to point to the authorized service account JSON key file (`backend/ai-resume-evaluator-498012-305d5547940c.json`).
+> * `GITHUB_TOKEN` is optional but highly recommended to prevent GitHub API rate-limiting during candidate verification.
 
 ---
 
 ## Running the Pipeline
 
-To run the pipeline on the test files configured in [main.py](file:///e:/AI-Resume-Evaluator-V2/main.py#L227-L229):
-1. Place the candidate resume PDF in the root directory (default: `Aniketh__Software_offCampus.pdf`).
-2. Place the Job Description document in the root directory (default: `JD for Interns 2.docx`).
-3. Ensure `Profile Completion&Strength.xlsx` is present.
-4. Execute:
-   ```bash
-   python main.py
-   ```
-5. Check the generated [output.json](file:///e:/AI-Resume-Evaluator-V2/output.json) file for the comprehensive multi-agent evaluation output.
+The system is split into a Python FastAPI backend and a React TypeScript frontend.
+
+### 1. Running the Backend Server
+Navigate to the `backend` directory:
+```bash
+cd backend
+# Activate the virtual environment
+.venv\Scripts\activate
+# Start the FastAPI server
+python server.py
+```
+The backend server will run on `http://127.0.0.1:8000`.
+
+### 2. Running the Frontend Dashboard
+Navigate to the `frontend` directory:
+```bash
+cd frontend
+# Start the Vite development server
+npm run dev
+```
+Open `http://localhost:5173` in your browser to access the dashboard.
