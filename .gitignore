@@ -53,3 +53,11 @@ backend/test_gmail_ingestion.py
 backend/register_watch.py
 backend/check_permissions.py
 backend/publish_test_message.py
+
+# Local LLM and workflow test scripts
+backend/test_ai_studio.py
+backend/test_regions_again.py
+backend/testing_model.py
+backend/agent_test.py
+backend/graph_test.py
+

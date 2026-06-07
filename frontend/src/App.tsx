@@ -117,6 +117,7 @@ interface Job {
   name: string;
   jd_filename: string | null;
   jd_text: string | null;
+  status?: 'active' | 'inactive';
   skills?: { name: string; weight: number }[];
   required_graduation_years?: number[];
   minimum_gpa?: number | null;
@@ -197,6 +198,9 @@ function App() {
   const [evaluationWizardStep, setEvaluationWizardStep] = useState<0 | 1>(0);
   const [newJobName, setNewJobName] = useState("");
   const [isUploadingJd, setIsUploadingJd] = useState(false);
+  const [isUpdatingJobStatus, setIsUpdatingJobStatus] = useState(false);
+  const [isEvaluatingBatch, setIsEvaluatingBatch] = useState(false);
+  const [batchEvalMessage, setBatchEvalMessage] = useState<string | null>(null);
   const jdFileInputRef = useRef<HTMLInputElement>(null);
 
   // Skill Weight Config States
@@ -361,6 +365,72 @@ function App() {
       setIsCreateJobOpen(false);
     } catch (err) {
       console.error("Failed to create job folder:", err);
+    }
+  };
+
+  // Toggle status of the active job role folder
+  const toggleJobStatus = async () => {
+    if (!selectedJobId) return;
+    const currentJob = jobs.find(j => j._id === selectedJobId);
+    if (!currentJob) return;
+    
+    const newStatus = currentJob.status === 'inactive' ? 'active' : 'inactive';
+    setIsUpdatingJobStatus(true);
+    try {
+      await axios.patch(`http://127.0.0.1:8000/api/jobs/${selectedJobId}/status`, {
+        status: newStatus
+      });
+      
+      setJobs(prev => prev.map(j => {
+        if (j._id === selectedJobId) {
+          return { ...j, status: newStatus };
+        }
+        return j;
+      }));
+    } catch (err) {
+      console.error("Failed to update job status:", err);
+      alert("Failed to toggle job status. Please verify the backend is running and try again.");
+    } finally {
+      setIsUpdatingJobStatus(false);
+    }
+  };
+
+  const triggerBatchEvaluation = async () => {
+    if (!selectedJobId) return;
+    const currentJob = jobs.find(j => j._id === selectedJobId);
+    if (!currentJob) return;
+
+    setIsEvaluatingBatch(true);
+    setBatchEvalMessage("Syncing with Google Drive... Fetching unprocessed resumes.");
+
+    try {
+      const response = await axios.post(`http://127.0.0.1:8000/api/jobs/${selectedJobId}/evaluate-batch`);
+      const data = response.data;
+      
+      alert(data.message || "Batch evaluation complete.");
+      
+      // Reload candidates list to show newly processed ones
+      const candidatesResponse = await axios.get("http://127.0.0.1:8000/api/candidates");
+      if (candidatesResponse.data && candidatesResponse.data.candidates) {
+        const mapped: Candidate[] = candidatesResponse.data.candidates.map((c: any) => {
+          let decision = c.final_decision?.toLowerCase() || "rejected";
+          if (decision === "approved") {
+            decision = "shortlisted";
+          }
+          return {
+            ...c,
+            id: c._id || c.id,
+            final_decision: decision
+          };
+        });
+        setCandidates(mapped);
+      }
+    } catch (err: any) {
+      console.error(err);
+      alert(err.response?.data?.detail || "Batch evaluation failed. Please check backend logs.");
+    } finally {
+      setIsEvaluatingBatch(false);
+      setBatchEvalMessage(null);
     }
   };
 
@@ -818,6 +888,9 @@ function App() {
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '2px' }}>
                     <span className="folder-candidates-count">{jobCandCount} applicants</span>
+                    <span className={`folder-status-badge ${job.status !== 'inactive' ? 'active' : 'inactive'}`}>
+                      {job.status !== 'inactive' ? 'Active' : 'Inactive'}
+                    </span>
                   </div>
                   {job.jd_filename && (
                     <span className="folder-jd-filename" title={job.jd_filename}>
@@ -871,9 +944,46 @@ function App() {
               {selectedJob ? (
                 <>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
                       <FolderOpen size={24} style={{ color: 'var(--color-accent)' }} />
                       <h2 style={{ margin: 0, fontSize: '20px', fontWeight: 600 }}>{selectedJob.name}</h2>
+                      
+                      <button
+                        onClick={toggleJobStatus}
+                        disabled={isUpdatingJobStatus}
+                        title={`Click to change status to ${selectedJob.status === 'inactive' ? 'Active' : 'Inactive'}`}
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                          padding: '4px 10px',
+                          borderRadius: '20px',
+                          fontSize: '12px',
+                          fontWeight: 600,
+                          border: '1px solid',
+                          cursor: 'pointer',
+                          transition: 'all 0.2s ease-in-out',
+                          boxShadow: 'var(--shadow-lg)',
+                          ...(selectedJob.status !== 'inactive' ? {
+                            backgroundColor: 'var(--color-success-bg)',
+                            color: 'var(--color-success)',
+                            borderColor: 'var(--color-success-border)',
+                          } : {
+                            backgroundColor: 'var(--color-error-bg)',
+                            color: 'var(--color-error)',
+                            borderColor: 'var(--color-error-border)',
+                          })
+                        }}
+                      >
+                        <span style={{
+                          width: '6px',
+                          height: '6px',
+                          borderRadius: '50%',
+                          backgroundColor: selectedJob.status !== 'inactive' ? 'var(--color-success)' : 'var(--color-error)',
+                          display: 'inline-block'
+                        }} />
+                        {selectedJob.status !== 'inactive' ? 'Active' : 'Inactive'}
+                      </button>
                     </div>
 
                     <div style={{ display: 'flex', gap: '12px' }}>
@@ -911,8 +1021,25 @@ function App() {
                             Update JD
                           </button>
                           <button 
+                             type="button" 
+                             className="btn-secondary" 
+                             disabled={selectedJob.status === 'inactive'}
+                             title={
+                               selectedJob.status === 'inactive' 
+                                 ? "This job is currently inactive." 
+                                 : "Evaluate candidate resumes from Google Drive"
+                             }
+                             onClick={triggerBatchEvaluation}
+                             style={{ padding: '8px 14px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                           >
+                             <FolderOpen size={14} />
+                             Evaluate Batch
+                           </button>
+                          <button 
                             type="button" 
                             className="btn-primary" 
+                            disabled={selectedJob.status === 'inactive'}
+                            title={selectedJob.status === 'inactive' ? "This job is currently inactive. Toggle it to Active to evaluate candidate resumes." : "Evaluate candidate resume"}
                             onClick={() => {
                               setEditingSkills(selectedJob.skills || []);
                               setEditingGradYears(selectedJob.required_graduation_years?.join(", ") || "");
@@ -923,6 +1050,12 @@ function App() {
                               setResumeFile(null);
                               setIsUploadOpen(true);
                             }}
+                            style={selectedJob.status === 'inactive' ? {
+                              opacity: 0.6,
+                              cursor: 'not-allowed',
+                              background: 'var(--text-muted)',
+                              boxShadow: 'none'
+                            } : undefined}
                           >
                             <Plus size={16} />
                             Evaluate Candidate
@@ -940,6 +1073,26 @@ function App() {
                       </button>
                     </div>
                   </div>
+
+                  {selectedJob.status === 'inactive' && (
+                    <div style={{
+                      backgroundColor: 'var(--color-error-bg)',
+                      border: '1px solid var(--color-error-border)',
+                      color: 'var(--color-error)',
+                      padding: '12px 16px',
+                      borderRadius: '12px',
+                      fontSize: '13.5px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '8px',
+                      fontWeight: 500,
+                      boxShadow: 'var(--shadow-lg)',
+                      marginTop: '4px'
+                    }}>
+                      <span style={{ fontSize: '16px' }}>⚠️</span>
+                      This job folder is currently Inactive. It will not accept new candidate evaluations. Toggle to Active to resume intake.
+                    </div>
+                  )}
 
                   {!selectedJob.jd_filename ? (
                     /* JD Upload Empty State Dropzone */
@@ -1410,6 +1563,7 @@ function App() {
                                   <th>Weighted Final</th>
                                   <th>Status</th>
                                   <th>View PDF</th>
+                                  <th>Delete</th>
                                 </tr>
                               </thead>
                               <tbody>
@@ -1545,11 +1699,53 @@ function App() {
                                           <span style={{ color: 'var(--text-muted)', fontSize: '12px' }}>N/A</span>
                                         )}
                                       </td>
+                                      <td onClick={(e) => e.stopPropagation()}>
+                                        <button
+                                          type="button"
+                                          title="Delete Candidate"
+                                          onClick={async () => {
+                                            if (window.confirm(`Are you sure you want to delete candidate ${candidate.name}?`)) {
+                                              try {
+                                                await axios.delete(`http://127.0.0.1:8000/api/candidates/${candidate.id}`);
+                                                setCandidates(prev => prev.filter(c => c.id !== candidate.id));
+                                                if (selectedCandidateId === candidate.id) {
+                                                  setSelectedCandidateId("");
+                                                }
+                                              } catch (err: any) {
+                                                console.error(err);
+                                                alert(err.response?.data?.detail || "Failed to delete candidate.");
+                                              }
+                                            }
+                                          }}
+                                          style={{
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            justifyContent: 'center',
+                                            padding: '6px',
+                                            borderRadius: '8px',
+                                            backgroundColor: 'transparent',
+                                            color: 'var(--color-error)',
+                                            border: '1px solid var(--color-error-border)',
+                                            cursor: 'pointer',
+                                            transition: 'all 0.2s',
+                                          }}
+                                          onMouseEnter={(e) => {
+                                            e.currentTarget.style.backgroundColor = 'var(--color-error-bg)';
+                                            e.currentTarget.style.borderColor = 'var(--color-error)';
+                                          }}
+                                          onMouseLeave={(e) => {
+                                            e.currentTarget.style.backgroundColor = 'transparent';
+                                            e.currentTarget.style.borderColor = 'var(--color-error-border)';
+                                          }}
+                                        >
+                                          <Trash2 size={13} />
+                                        </button>
+                                      </td>
                                     </tr>
                                   ))
                                 ) : (
                                   <tr>
-                                    <td colSpan={6} style={{ textAlign: 'center', padding: '32px', color: 'var(--text-secondary)' }}>
+                                    <td colSpan={7} style={{ textAlign: 'center', padding: '32px', color: 'var(--text-secondary)' }}>
                                       No candidate evaluations listed under this job role folder.
                                     </td>
                                   </tr>
@@ -2690,6 +2886,21 @@ function App() {
                 )}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {isEvaluatingBatch && (
+        <div className="modal-backdrop">
+          <div className="upload-modal" style={{ width: '480px', textAlign: 'center', padding: '40px', display: 'flex', flexDirection: 'column', gap: '16px', alignItems: 'center' }}>
+            <Loader2 className="spinner-icon" size={48} style={{ color: 'var(--color-accent)' }} />
+            <h2 style={{ fontSize: '20px', fontWeight: 600, margin: '0' }}>Syncing with Google Drive</h2>
+            <p style={{ fontSize: '14px', color: 'var(--text-secondary)', margin: '0', lineHeight: 1.5 }}>
+              {batchEvalMessage || "Downloading unprocessed resumes and running assessment pipeline..."}
+            </p>
+            <p style={{ fontSize: '12px', color: 'var(--text-muted)', margin: '10px 0 0', fontStyle: 'italic' }}>
+              This may take a few minutes. Please do not close this window.
+            </p>
           </div>
         </div>
       )}

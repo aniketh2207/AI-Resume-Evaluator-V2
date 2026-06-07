@@ -166,6 +166,29 @@
   border-color: var(--border-hover);
 }
 
+.btn-primary:disabled,
+.btn-secondary:disabled,
+.btn-danger:disabled {
+  opacity: 0.55;
+  cursor: not-allowed !important;
+}
+
+.btn-primary:disabled:hover {
+  background: linear-gradient(135deg, #38BDF8 0%, #0EA5E9 100%) !important;
+  box-shadow: 0 4px 14px rgba(14, 165, 233, 0.25) !important;
+  transform: none !important;
+}
+
+.btn-secondary:disabled:hover {
+  background-color: transparent !important;
+  border-color: var(--border-color) !important;
+}
+
+.btn-danger:disabled:hover {
+  background-color: transparent !important;
+  border-color: var(--color-error-border) !important;
+}
+
 .btn-danger {
   background-color: transparent;
   color: var(--color-error);
@@ -829,24 +852,56 @@
   font-weight: 600;
 }
 
-.sidebar .folder-badge {
+.sidebar .folder-badge,
+.sidebar .folder-status-badge {
   font-size: 9px;
-  padding: 1px 4px;
+  padding: 2px 6px;
   border-radius: 4px;
-  font-weight: 600;
+  font-weight: 700;
   text-transform: uppercase;
+  letter-spacing: 0.3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease-in-out;
 }
 
-.sidebar .folder-badge.no-jd {
-  background-color: var(--color-error-bg);
-  color: var(--color-error);
-  border: 1px solid var(--color-error-border);
+.sidebar .folder-item .folder-badge.has-jd {
+  background-color: rgba(16, 185, 129, 0.2);
+  color: #34D399;
+  border: 1px solid rgba(16, 185, 129, 0.4);
 }
 
-.sidebar .folder-badge.has-jd {
-  background-color: var(--color-success-bg);
-  color: var(--color-success);
-  border: 1px solid var(--color-success-border);
+.sidebar .folder-item .folder-badge.no-jd {
+  background-color: rgba(244, 63, 94, 0.2);
+  color: #FB7185;
+  border: 1px solid rgba(244, 63, 94, 0.4);
+}
+
+.sidebar .folder-item .folder-status-badge.active {
+  background-color: rgba(16, 185, 129, 0.2);
+  color: #34D399;
+  border: 1px solid rgba(16, 185, 129, 0.4);
+}
+
+.sidebar .folder-item .folder-status-badge.inactive {
+  background-color: rgba(244, 63, 94, 0.2);
+  color: #FB7185;
+  border: 1px solid rgba(244, 63, 94, 0.4);
+}
+
+.sidebar .folder-item.active .folder-badge.has-jd,
+.sidebar .folder-item.active .folder-status-badge.active {
+  background-color: #FFFFFF;
+  color: #059669;
+  border: 1px solid #FFFFFF;
+}
+
+.sidebar .folder-item.active .folder-badge.no-jd,
+.sidebar .folder-item.active .folder-status-badge.inactive {
+  background-color: #FFFFFF;
+  color: #E11D48;
+  border: 1px solid #FFFFFF;
 }
 
 .sidebar .folder-candidates-count {

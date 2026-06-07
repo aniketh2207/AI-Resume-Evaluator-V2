@@ -1,106 +1,24 @@
 import os
 import sys
 import json
-from typing import TypedDict, Optional, List
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from bson import ObjectId
+from typing import Optional, List
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_google_vertexai import ChatVertexAI
-from extractor import extract_candidate_info, CandidateInfo, read_document_content
 from langgraph.graph import StateGraph, START, END
-from tools import run_github_agent, GitHubReport
-from assessor import load_scoring_matrix, evaluate_candidate
+import time
 
-# Force Windows stdout to handle UTF-8 and Emojis without crashing
-sys.stdout.reconfigure(encoding='utf-8')
-
-# Boot-time configuration check
-load_dotenv()
-if not os.getenv("GOOGLE_API_KEY"):
-    raise EnvironmentError("GOOGLE_API_KEY is not set in environment variables.")
-
-# Main State Definition
-class ATS_State(TypedDict):
-    raw_resume: str
-    jd_text: str                  # The extracted JD text
-    matrix_path: Optional[str]    # Path to Excel scoring sheet
-    job_id: Optional[str]         # Associated Job ID for custom weights
-    
-    # Structured Candidate Profile
-    name: Optional[str]
-    github_username: Optional[str]
-    email: Optional[str]
-    phone: Optional[str]
-    category: Optional[str]
-    education: Optional[list]
-    experience: Optional[list]
-    projects: Optional[list]
-    skills: Optional[list]
-    certifications: Optional[list]
-    github_project_links: Optional[list]
-    miscellaneous_details: Optional[str]
-    
-    # Live data & verification
-    github_data: Optional[dict]
-    project_verification: Optional[str]
-    
-    # Score reports
-    score: Optional[int]          # The Excel Matrix Base Score
-    reasoning: Optional[str]
-    ats_reasoning_summary: Optional[str]
-    jd_score: Optional[int]       # The JD Fit Score
-    jd_reasoning: Optional[str]
-    jd_reasoning_summary: Optional[str]
-    final_weighted_score: Optional[float] # The combined math
-    final_decision: Optional[str]
-    candidate_email: Optional[str]
-    hiring_manager_brief: Optional[str]
-    interview_questions: Optional[list[str]]
-    resume_filename: Optional[str]
-    resume_gcs_uri: Optional[str]
-
-class SkillScore(BaseModel):
-    name: str = Field(description="The name of the core technical skill being evaluated.")
-    score: int = Field(description="The match score out of 100 for this specific skill (0-100).")
-
-class JDFitResult(BaseModel):
-    detailed_match_analysis: str = Field(description="Step-by-step detailed matching analysis comparing the candidate's skills, experience, and projects against each specific JD requirement (mandatory, good-to-have, and responsibilities). Identify exact matches, partial matches, and gaps first.")
-    skills_scores: List[SkillScore] = Field(description="The match score out of 100 for each of the requested job skills.")
-    reasoning: str = Field(description="Concise reasoning for the scores.")
-    jd_reasoning_summary: str = Field(description="A concise, 1-2 sentence high-level summary explaining precisely why the candidate received this JD fit score based on their tech stack match. This will be shown on hover.")
-
-class FinalDeliverables(BaseModel):
-    candidate_email: str = Field(description="A personalized email to the candidate regarding the next steps or rejection.")
-    hiring_manager_brief: str = Field(description="A concise summary for the HR team detailing their technical strengths and JD alignment.")
-    interview_questions: list[str] = Field(description="3 custom technical interview questions based on their projects and the JD.")
-
-class ProjectVerificationResult(BaseModel):
-    verification_report: str = Field(description="Detailed verification report in markdown format comparing resume projects against actual GitHub repositories.")
-
-class ExtractedSkill(BaseModel):
-    name: str = Field(description="The name of the core technical skill, tool, or framework.")
-    weight: int = Field(description="Initial default weight (an integer out of 100). The sum of all skills must equal 100.")
-
-class JDSkillsExtraction(BaseModel):
-    skills: List[ExtractedSkill] = Field(description="A list of 4 to 8 primary technical skills extracted from the job description.")
-
-# Model Tiering Setup
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "E:/AI-Resume-Evaluator-V2/backend/ai-resume-evaluator-498012-305d5547940c.json"
-fast_llm = ChatVertexAI(
-    model_name="gemini-2.5-flash",
-    project="ai-resume-evaluator-498012",
-    location="us-central1",
-    temperature=0
+# Import from core and models
+from app.core.config import fast_llm, heavy_llm, candidates_collection, jobs_collection, backend_dir
+from app.models.schemas import (
+    ATS_State, SkillScore, JDFitResult, FinalDeliverables, 
+    ProjectVerificationResult, ExtractedSkill, JDSkillsExtraction
 )
-heavy_llm = ChatVertexAI(
-    model_name="gemini-2.5-pro",
-    project="ai-resume-evaluator-498012",
-    location="us-central1",
-    temperature=0
-)
+from app.services.gcs_service import upload_resume_to_gcs
 
-# Backward compatibility binding
-llm = fast_llm
+# Import utilities
+from app.utils.extractor import extract_candidate_info, CandidateInfo, read_document_content, check_candidate_eligibility
+from app.utils.tools import run_github_agent, GitHubReport
+from app.utils.assessor import load_scoring_matrix, evaluate_candidate
 
 def route_candidate(state: ATS_State):
     if state['category'] == "student":
@@ -195,6 +113,7 @@ def github_node(state: ATS_State):
         }
 
 def project_verification_node(state: ATS_State):
+    time.sleep(3)
     username = state.get("github_username")
     if not state.get("projects") or not state.get("github_data") or not state["github_data"].get("recent_projects"):
         print("Bypassing Project Verification (no GitHub profile or repositories)...")
@@ -242,9 +161,9 @@ def project_verification_node(state: ATS_State):
 
 def student_node(state: ATS_State):
     print("Candidate is a student, evaluating against Student Matrix...")
-    excel_path = state.get("matrix_path") or "Profile Completion&Strength.xlsx"
+    excel_path = state.get("matrix_path") or os.path.join("data", "Profile Completion&Strength.xlsx")
     if not os.path.isabs(excel_path):
-        excel_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), excel_path)
+        excel_path = os.path.join(backend_dir, excel_path)
     try:
         matrix = load_scoring_matrix(excel_path, sheet_name="Student_CareerScapeScore")
         result = evaluate_candidate(
@@ -288,9 +207,9 @@ def student_node(state: ATS_State):
 
 def experienced_node(state: ATS_State):
     print("Candidate is experienced, evaluating against Experienced Matrix...")
-    excel_path = state.get("matrix_path") or "Profile Completion&Strength.xlsx"
+    excel_path = state.get("matrix_path") or os.path.join("data", "Profile Completion&Strength.xlsx")
     if not os.path.isabs(excel_path):
-        excel_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), excel_path)
+        excel_path = os.path.join(backend_dir, excel_path)
     try:
         matrix = load_scoring_matrix(excel_path, sheet_name="Expereinced Candidate")
         result = evaluate_candidate(
@@ -333,6 +252,7 @@ def experienced_node(state: ATS_State):
         }
 
 def jd_evaluator_node(state: ATS_State):
+    time.sleep(3)
     print("Evaluating candidate against Job Description with custom skill weights...")
     try:
         # Fetch job skills
@@ -390,7 +310,7 @@ def jd_evaluator_node(state: ATS_State):
             
             JOB DESCRIPTION:
             {state['jd_text']}
-
+ 
             You MUST evaluate and score the candidate on exactly these technical skills:
             {skills_instruction}
             
@@ -437,7 +357,9 @@ def jd_evaluator_node(state: ATS_State):
             
         jd_score = int(round(weighted_sum))
         
-        base_score = state.get("score", 0)
+        base_score = state.get("score")
+        if base_score is None:
+            base_score = 0
         final_score = (base_score * 0.3) + (jd_score * 0.7)
         
         decision = "shortlisted" if final_score >= 60.0 else "rejected"
@@ -468,6 +390,7 @@ def jd_evaluator_node(state: ATS_State):
         }
 
 def communicator_node(state: ATS_State):
+    time.sleep(3)
     print("Synthesizing final HR deliverables...")
     try:
         structured_llm = fast_llm.with_structured_output(FinalDeliverables)
@@ -508,7 +431,7 @@ def communicator_node(state: ATS_State):
             "interview_questions": ["Verification interview needed to assess raw skills."]
         }
 
-# from here starts the langgraph routing logic 
+# StateGraph compilation
 workflow = StateGraph(ATS_State)
 workflow.add_node("extractor", extractor_node)
 workflow.add_node("github", github_node)
@@ -531,57 +454,110 @@ workflow.add_edge("experienced", "jd_evaluator")
 workflow.add_edge("jd_evaluator", "communicator")
 workflow.add_edge("communicator", END)
 
-app = workflow.compile()
+ats_workflow = workflow.compile()
 
-if __name__ == "__main__":
-    pdf_path = "Aniketh__Software_offCampus.pdf"
-    jd_path = "JD for Interns 2.docx"
-    matrix_path = "Profile Completion&Strength.xlsx"
-    
-    test_resume = read_document_content(fast_llm, pdf_path)
-    test_jd = read_document_content(fast_llm, jd_path)
+def process_candidate_pipeline(resume_path: str, jd_path: str, job_id: Optional[str] = None, resume_gcs_uri: Optional[str] = None):
+    """Shared function to run the LangGraph pipeline and save to DB."""
+    print("Extracting text from files...")
+    resume_text = read_document_content(fast_llm, resume_path)
+    jd_text = read_document_content(fast_llm, jd_path)
+
+    # Check eligibility first if job details contain criteria
+    job = None
+    if job_id:
+        try:
+            job = jobs_collection.find_one({"_id": ObjectId(job_id)})
+        except Exception as e:
+            print(f"Error fetching job for eligibility pre-screen: {e}")
+
+    if job and (job.get("required_graduation_years") or job.get("minimum_gpa") is not None or job.get("other_eligibility_criteria")):
+        criteria = {
+            "required_graduation_years": job.get("required_graduation_years", []),
+            "minimum_gpa": job.get("minimum_gpa"),
+            "other_eligibility_criteria": job.get("other_eligibility_criteria")
+        }
+        
+        print("Checking candidate eligibility against JD requirements...")
+        try:
+            eligibility = check_candidate_eligibility(fast_llm, resume_text, criteria)
+            print(f"Eligibility decision: {eligibility.is_eligible}. Reason: {eligibility.reason}")
+            
+            if not eligibility.is_eligible:
+                print("Candidate is ineligible. Short-circuiting LangGraph pipeline evaluation!")
+                
+                # Fast name extraction
+                candidate_name = "Candidate"
+                try:
+                    from pydantic import BaseModel, Field
+                    class QuickName(BaseModel):
+                        name: str = Field(description="The full name of the candidate")
+                    name_extractor = fast_llm.with_structured_output(QuickName)
+                    extracted_name = name_extractor.invoke(f"Extract the candidate's full name from their resume text:\n\n{resume_text[:1000]}")
+                    candidate_name = extracted_name.name
+                except Exception as name_err:
+                    print(f"Failed to extract candidate name for short-circuited flow: {name_err}")
+                
+                final_state = {
+                    "name": candidate_name,
+                    "github_username": "N/A",
+                    "email": "N/A",
+                    "phone": "N/A",
+                    "category": "student",
+                    "education": [],
+                    "experience": [],
+                    "projects": [],
+                    "skills": [],
+                    "certifications": [],
+                    "miscellaneous_details": "Skipped due to eligibility filter.",
+                    "github_data": None,
+                    "project_verification": "Skipped: Candidate did not meet basic job eligibility requirements.",
+                    "score": 0,
+                    "reasoning": f"AUTOMATIC PRE-SCREENING REJECTION:\n\nCandidate failed eligibility rules:\n{eligibility.reason}",
+                    "ats_reasoning_summary": "Failed basic eligibility pre-screening.",
+                    "jd_score": 0,
+                    "jd_reasoning": f"AUTOMATIC PRE-SCREENING REJECTION:\n\nCandidate failed eligibility rules:\n{eligibility.reason}",
+                    "jd_reasoning_summary": "Failed basic eligibility pre-screening.",
+                    "final_weighted_score": 0.0,
+                    "final_decision": "rejected",
+                    "candidate_email": f"Dear {candidate_name},\n\nThank you for your interest in our job role. After reviewing your profile, we have determined that you do not meet the minimum eligibility requirements specified for this position. Therefore, we will not be moving forward with your application at this time.\n\nBest regards,\nHR Recruiting Team",
+                    "hiring_manager_brief": f"Candidate failed eligibility check: {eligibility.reason}. Evaluation bypassed to save pipeline usage.",
+                    "interview_questions": [],
+                    "job_id": job_id,
+                    "resume_gcs_uri": resume_gcs_uri
+                }
+                
+                inserted_doc = candidates_collection.insert_one(final_state)
+                final_state["_id"] = str(inserted_doc.inserted_id)
+                return final_state
+        except Exception as filter_err:
+            print(f"Error during eligibility screening, continuing with full pipeline: {filter_err}")
+
     state: ATS_State = {
-        "raw_resume": test_resume,
-        "jd_text": test_jd,
-        "matrix_path": matrix_path,
-        "name": None,
-        "github_username": None,
-        "email": None,
-        "phone": None,
-        "category": None,
-        "education": None,
-        "experience": None,
-        "projects": None,
-        "skills": None,
-        "certifications": None,
-        "miscellaneous_details": None,
-        "github_data": None,
-        "project_verification": None,
-        "score": None,
-        "reasoning": None,
-        "jd_score": None,
-        "jd_reasoning": None,
-        "final_weighted_score": None,
-        "final_decision": None,
-        "candidate_email": None,
-        "hiring_manager_brief": None,
-        "interview_questions": None
+        "raw_resume": resume_text,
+        "jd_text": jd_text,
+        "matrix_path": os.path.join("data", "Profile Completion&Strength.xlsx"), 
+        "job_id": job_id,
+        "name": None, "github_username": None, "email": None, "phone": None,
+        "category": None, "education": None, "experience": None, "projects": None,
+        "skills": None, "certifications": None, "miscellaneous_details": None,
+        "github_data": None, "project_verification": None, "score": None,
+        "reasoning": None, "ats_reasoning_summary": None, "jd_score": None, "jd_reasoning": None, "jd_reasoning_summary": None,
+        "final_weighted_score": None, "final_decision": None,
+        "candidate_email": None, "hiring_manager_brief": None, "interview_questions": None,
+        "resume_gcs_uri": resume_gcs_uri
     }
-    
-    print("Running the full ATS Multi-Agent pipeline...")
-    final_state = app.invoke(state)
-    
-    import json
-    print("\n--- FINAL PIPELINE STATE (JSON) ---")
-    print_state = final_state.copy()
-    if "raw_resume" in print_state:
-        print_state["raw_resume"] = print_state["raw_resume"][:100] + "..."
-    if "jd_text" in print_state:
-        print_state["jd_text"] = print_state["jd_text"][:100] + "..."
-    print(json.dumps(print_state, indent=4, ensure_ascii=False))
-    
-    with open("output.json", "w", encoding="utf-8") as f:
-        json.dump(final_state, f, indent=4, ensure_ascii=False)
-    print("\nPipeline execution complete. Output saved to 'output.json'.")
 
+    print("Triggering LangGraph Multi-Agent Pipeline...")
+    final_state = ats_workflow.invoke(state)
 
+    final_state.pop("raw_resume", None)
+    final_state.pop("jd_text", None)
+    
+    # Associate evaluation with a specific job role if provided
+    if job_id:
+        final_state["job_id"] = job_id
+    
+    inserted_doc = candidates_collection.insert_one(final_state)
+    final_state["_id"] = str(inserted_doc.inserted_id)
+    
+    return final_state

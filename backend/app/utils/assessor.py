@@ -4,7 +4,7 @@ import pandas as pd
 import json
 from langchain_core.messages import SystemMessage, HumanMessage
 
-# 1. Fixed Pydantic syntax
+# Fixed Pydantic syntax
 class ScoringBreakdown(BaseModel):
     about_me: float = Field(default=0.0, description="Raw decimal score for 'About Me' / 'Profile Completion'")
     personal_identification: float = Field(default=0.0, description="Raw decimal score for 'Personal' / 'Identification'")
@@ -46,7 +46,7 @@ class EvaluationResult(BaseModel):
     ats_reasoning_summary: str = Field(description="A concise, 1-2 sentence high-level summary explaining precisely why the candidate received this base score (pointing to their major strengths or deductions). This will be shown on hover.")
     decision: Literal["approved", "rejected"] = Field(description="The final decision based on the score. If score >= 60, 'approved', else 'rejected'.")
 
-# 2. Fixed Data Loader to be dynamic and support sheets
+# Fixed Data Loader to be dynamic and support sheets
 def load_scoring_matrix(file_path: str, sheet_name: str = None) -> str:
     if sheet_name:
         data = pd.read_excel(file_path, sheet_name=sheet_name)
@@ -59,7 +59,7 @@ def load_scoring_matrix(file_path: str, sheet_name: str = None) -> str:
     cleaned_data = cleaned_data.fillna('')
     return cleaned_data.to_markdown(index=False)
 
-# 3. Fixed Variable Names in the F-String and added Resume support
+# Fixed Variable Names in the F-String and added Resume support
 def evaluate_candidate(
     llm, 
     candidate_name: str, 
@@ -99,7 +99,7 @@ def evaluate_candidate(
     Your job is to evaluate a candidate's GitHub profile, resume details, and project verification audits against a specific scoring matrix sheet.
     
     NOTE: The current local simulation time is May 30, 2026. Therefore, dates in 2025 and 2026 are valid recent historical dates, not future dates.
-
+ 
     Here is the exact scoring matrix you MUST follow word-by-word to calculate their score:
     {scoring_markdown}
 
@@ -168,7 +168,7 @@ if __name__ == "__main__":
     )
     
     # Load the matrix
-    matrix_path = os.path.join(backend_dir, "Profile Completion&Strength.xlsx")
+    matrix_path = os.path.join(backend_dir, "data", "Profile Completion&Strength.xlsx")
     scoring_markdown = load_scoring_matrix(matrix_path, sheet_name="Student_CareerScapeScore")
     
     # Create a mock candidate
